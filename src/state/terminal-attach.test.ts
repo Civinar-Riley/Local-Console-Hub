@@ -245,10 +245,13 @@ describe("terminal attachment", () => {
 
     session.resize(120, 32);
     vi.advanceTimersByTime(RESIZE_SETTLE_MS);
+    // The size is the view's only once the backend has answered it.
+    await Promise.resolve();
     // A second observation of the same geometry — a layout pass, a scrollbar
     // appearing — is not a resize.
     session.resize(120, 32);
     vi.advanceTimersByTime(RESIZE_SETTLE_MS);
+    await Promise.resolve();
 
     expect(fake.resized).toEqual([{ cols: 120, rows: 32 }]);
     session.close();

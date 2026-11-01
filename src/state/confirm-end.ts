@@ -73,7 +73,12 @@ export async function requestConfirmedEnd(target: EndTarget): Promise<ConfirmEnd
       return { ended: false, message: `没有结束。${value.message}` };
     }
     return value;
-  } catch {
-    return { ended: false, message: NOTHING_ENDED };
+  } catch (cause) {
+    // The backend answers its own refusals in the payload above; a rejection
+    // here is the transport itself. Saying only "nothing ended" would read as
+    // a checked, deliberate keeping of the process rather than a request that
+    // never got its answer.
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return { ended: false, message: `没有结束。这次请求没有送达后台：${reason}` };
   }
 }

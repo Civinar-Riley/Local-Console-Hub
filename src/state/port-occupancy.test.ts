@@ -24,6 +24,7 @@ function row(overrides: Partial<ListenerRowDto> = {}): ListenerRowDto {
     programPath: "D:\\ComfyUI\\python.exe",
     attribution: "external",
     sessionId: null,
+    createdAt: "133724480000000000",
     ...overrides,
   };
 }

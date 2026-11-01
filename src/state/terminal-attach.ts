@@ -169,12 +169,14 @@ export function openTerminalSession(
       }
       settling = setTimeout(() => {
         settling = null;
-        // Remembered before the call: a size the backend never got is not one
-        // the view has, and remembering it anyway would stop the next
-        // observation from retrying it.
-        reported = { cols, rows };
+        // Remembered only once the backend has taken the size: one it refused
+        // was never applied, and recording it before the answer would stop the
+        // next observation of the same size from retrying it.
         backend
           .resize(sessionId, cols, rows)
+          .then(() => {
+            reported = { cols, rows };
+          })
           .catch((cause: unknown) => handlers.onError(sessionErrorMessage(cause)));
       }, RESIZE_SETTLE_MS);
     },

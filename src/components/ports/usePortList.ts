@@ -64,6 +64,9 @@ export function usePortList(
   view: SidebarView,
   connected: boolean,
   sessions: readonly SessionName[],
+  /** The host's clock, ticking a few times a minute. Rendered captions read
+   * it rather than calling the clock during render. */
+  nowMs: number,
 ): PortListModel {
   const [state, setState] = useState(initialListenRefresh);
   const [query, setQuery] = useState("");
@@ -136,7 +139,10 @@ export function usePortList(
     selected,
     select: setSelectedKey,
     empty: portListMessage(filtered, query, state),
-    caption: checkCaption(state, state.checkedAtMs ?? 0).text,
+    // The host's clock, not the check's own time: `justChecked` means "still
+    // within a few seconds of the current check", and answering the check's
+    // timestamp would make it true forever.
+    caption: checkCaption(state, nowMs).text,
     inProgress: state.inProgress,
     refresh: () => {
       if (!connected) return;

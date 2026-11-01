@@ -18,6 +18,7 @@ describe("isListenerListDto", () => {
             programPath: null,
             attribution: "external",
             sessionId: null,
+            createdAt: "133724480000000000",
           },
         ],
       }),

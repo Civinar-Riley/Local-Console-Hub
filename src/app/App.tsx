@@ -96,7 +96,17 @@ export default function App() {
   const [tab, setTab] = useState<WorkspaceTab>("terminal");
   const [query, setQuery] = useState("");
   const [railView, setRailView] = useState<SidebarView>("sessions");
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNoticeText] = useState<string | null>(null);
+  /**
+   * When `notice` was last set. The status bar composes it against the
+   * registry's action errors by recency: a failure stops covering the screen
+   * the moment a newer piece of feedback exists, whatever surface produced it.
+   */
+  const [noticeAt, setNoticeAt] = useState(0);
+  const setNotice = useCallback((message: string) => {
+    setNoticeText(message);
+    setNoticeAt(Date.now());
+  }, []);
   const [now, setNow] = useState(() => new Date());
   const narrow = useMediaQuery("(max-width: 767px)");
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -104,6 +114,7 @@ export default function App() {
     railView,
     connection.state === "connected",
     sessions.map((session) => ({ id: session.config.id, name: session.config.name })),
+    now.getTime(),
   );
   /** Bumped for each "新建 PowerShell" the workspace carried out (#62). */
   const [focusRequest, setFocusRequest] = useState(0);
@@ -149,7 +160,12 @@ export default function App() {
 
   useEffect(() => {
     if (notice === null) return;
-    const timer = window.setTimeout(() => setNotice(null), NOTICE_TIMEOUT_MS);
+    const timer = window.setTimeout(() => {
+      setNoticeText(null);
+      // The timestamp goes with it: an expired notice stops being the newest
+      // feedback, so a still-unresolved action error takes the line back.
+      setNoticeAt(0);
+    }, NOTICE_TIMEOUT_MS);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
@@ -248,9 +264,17 @@ export default function App() {
   const selected = sessions.find((session) => session.config.id === selectedId) ?? sessions[0];
   const counts = useMemo(() => liveCounts(sessions), [sessions]);
   const diagnosticSessionCount = registry.configReport?.sessions.length ?? sessions.length;
+  // The registry's action error speaks until something newer happens: an
+  // error reported after the last notice keeps the line, and any notice the
+  // user earns afterwards — a copy, a save, a log action — takes it back. A
+  // tie goes to the error, which is also the case when no notice has been
+  // set yet (`noticeAt` is 0).
   const statusNotice =
-    registry.error ??
-    (registry.loading && !registry.initializationError ? "正在同步会话…" : notice);
+    registry.error !== null && noticeAt <= registry.errorAt
+      ? registry.error
+      : registry.loading && !registry.initializationError
+        ? "正在同步会话…"
+        : notice;
 
   /** Preview mode: actions render from the real lifecycle rules but perform
    * nothing, because there is no run behind them to act on. */

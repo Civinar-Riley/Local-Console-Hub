@@ -21,6 +21,12 @@ export interface ListenerRowDto {
   programPath: string | null;
   attribution: ListenerAttribution;
   sessionId: string | null;
+  /**
+   * Decimal creation time of `pid`, in the 100-ns ticks Windows reports. The
+   * confirm command repeats it back, so the backend can re-identify the exact
+   * process before ending it (`ipc/listen.rs` sends it on every row).
+   */
+  createdAt: string | null;
 }
 
 export interface ListenerListDto {
@@ -45,6 +51,7 @@ export function isListenerRowDto(value: unknown): value is ListenerRowDto {
   const programPath = row.programPath === null || typeof row.programPath === "string";
   const attribution = ATTRIBUTIONS.includes(row.attribution as ListenerAttribution);
   const sessionId = row.sessionId === null || typeof row.sessionId === "string";
+  const createdAt = row.createdAt === null || typeof row.createdAt === "string";
   return (
     protocol &&
     typeof row.address === "string" &&
@@ -53,7 +60,8 @@ export function isListenerRowDto(value: unknown): value is ListenerRowDto {
     processName &&
     programPath &&
     attribution &&
-    sessionId
+    sessionId &&
+    createdAt
   );
 }
 

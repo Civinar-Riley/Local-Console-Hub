@@ -24,6 +24,7 @@ beforeEach(() => {
     live: true,
     loading: false,
     error: null,
+    errorAt: 0,
     initializationError: null,
     configReport: { fileStatus: "missing", configPath: "config.yaml", sessions: [], errors: [] },
     configReportError: null,

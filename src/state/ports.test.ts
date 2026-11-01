@@ -46,6 +46,7 @@ function raw(overrides: Partial<ListenerRowDto> & Pick<ListenerRowDto, "port">):
     programPath: null,
     attribution: "external",
     sessionId: null,
+    createdAt: "133724480000000000",
     ...overrides,
   };
 }

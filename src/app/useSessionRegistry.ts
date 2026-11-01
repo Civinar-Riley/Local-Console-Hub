@@ -45,6 +45,13 @@ export interface SessionRegistry {
   live: boolean;
   /** The most recent failed action, for the status bar. */
   error: string | null;
+  /**
+   * When `error` was reported, as `Date.now()` at the moment of the failure.
+   * The status bar composes this against its own notices by recency, so a
+   * success message the user earns after a refused command is not swallowed
+   * by the older failure's text.
+   */
+  errorAt: number;
   /** A failed session initialization; the registry retries with capped delay. */
   initializationError: string | null;
   /** Startup config report, including file-level and per-entry problems. */
@@ -155,6 +162,16 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
     snapshot: SessionRegistrySnapshot;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorAt, setErrorAt] = useState(0);
+  /**
+   * Report a failed action. The timestamp travels beside the message because
+   * the failure's only consumer — the status bar — decides between this and
+   * its own notices by which one happened last, not by which kind it is.
+   */
+  const reportError = useCallback((message: string) => {
+    setError(message);
+    setErrorAt(Date.now());
+  }, []);
   const closing = useRef(new Set<string>());
   const [closingSessionIds, setClosingSessionIds] = useState<ReadonlySet<string>>(new Set());
   /**
@@ -228,15 +245,18 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
   const configReport = snapshot?.configReport ?? null;
   const configReportError = snapshot?.configReportError ?? null;
 
-  const run = useCallback((command: string, sessionId: string) => {
-    // The result is deliberately ignored: a lifecycle command answers with
-    // the post-operation snapshot, and the event that follows publishes the
-    // same state to everyone (the window, the tray, a future scheduler).
-    // Rendering from the event alone is what keeps them from disagreeing. The
-    // two "open" actions return no state, so they share this path and its
-    // error handling instead of growing another one.
-    invoke(command, { sessionId }).catch((cause) => setError(sessionErrorMessage(cause)));
-  }, []);
+  const run = useCallback(
+    (command: string, sessionId: string) => {
+      // The result is deliberately ignored: a lifecycle command answers with
+      // the post-operation snapshot, and the event that follows publishes the
+      // same state to everyone (the window, the tray, a future scheduler).
+      // Rendering from the event alone is what keeps them from disagreeing. The
+      // two "open" actions return no state, so they share this path and its
+      // error handling instead of growing another one.
+      invoke(command, { sessionId }).catch((cause) => reportError(sessionErrorMessage(cause)));
+    },
+    [reportError],
+  );
 
   /**
    * The one command whose answer the window *does* read (#62).
@@ -248,21 +268,24 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
    * you asked for". The pair is adopted into the watch as well, which is what
    * makes the row exist even if the event is still in flight.
    */
-  const createTerminal = useCallback(async (cwd?: string): Promise<string | null> => {
-    try {
-      const raw = await invoke<unknown>("create_temporary_terminal", { cwd });
-      if (!isCreatedSessionDto(raw)) {
-        throw new Error("create_temporary_terminal 返回了无法识别的载荷");
+  const createTerminal = useCallback(
+    async (cwd?: string): Promise<string | null> => {
+      try {
+        const raw = await invoke<unknown>("create_temporary_terminal", { cwd });
+        if (!isCreatedSessionDto(raw)) {
+          throw new Error("create_temporary_terminal 返回了无法识别的载荷");
+        }
+        controller.current?.adopt(raw);
+        return raw.config.id;
+      } catch (cause) {
+        // A shell or directory that is not there is a real answer, not a
+        // silent failure: it is the message the user needs (H06).
+        reportError(sessionErrorMessage(cause));
+        return null;
       }
-      controller.current?.adopt(raw);
-      return raw.config.id;
-    } catch (cause) {
-      // A shell or directory that is not there is a real answer, not a
-      // silent failure: it is the message the user needs (H06).
-      setError(sessionErrorMessage(cause));
-      return null;
-    }
-  }, []);
+    },
+    [reportError],
+  );
 
   /**
    * "添加应用" (#64).
@@ -328,27 +351,53 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
     }
   }, []);
 
-  const closeTerminal = useCallback(async (sessionId: string) => {
-    if (closing.current.has(sessionId)) return;
-    closing.current.add(sessionId);
-    setClosingSessionIds(new Set(closing.current));
-    try {
-      // The backend confirms the owned tree has ended before removal. A
-      // failed stop must leave the row and its process ownership intact.
-      const runtime = await invoke<unknown>("get_session", { sessionId });
-      if (!isSessionRuntimeDto(runtime)) throw new Error("无法读取终端状态，未关闭会话");
-      if (runtime.status !== "stopped" && runtime.status !== "exited") {
-        await invoke("stop_session", { sessionId });
-      }
-      await invoke("remove_session", { sessionId });
-      controller.current?.forget(sessionId);
-    } catch (cause) {
-      setError(sessionErrorMessage(cause));
-    } finally {
-      closing.current.delete(sessionId);
+  const closeTerminal = useCallback(
+    async (sessionId: string) => {
+      if (closing.current.has(sessionId)) return;
+      closing.current.add(sessionId);
       setClosingSessionIds(new Set(closing.current));
-    }
-  }, []);
+      // The backend confirms the owned tree has ended before removal. A failed
+      // stop must leave the row and its process ownership intact.
+      const read = async () => {
+        const raw = await invoke<unknown>("get_session", { sessionId });
+        if (!isSessionRuntimeDto(raw)) throw new Error("无法读取终端状态，未关闭会话");
+        return raw;
+      };
+      try {
+        // The state machine accepts a stop from `running` alone (spec §5), so
+        // asking from any other status is a refusal the close did not need: an
+        // `error` row without a run is removable right away, and one with a run
+        // is owed the removal refusal that says so.
+        const runtime = await read();
+        if (runtime.status === "running") {
+          try {
+            await invoke("stop_session", { sessionId });
+          } catch (cause) {
+            // The run read above may have ended on its own before the stop
+            // landed — the state machine refuses that stop, but the settled
+            // session is exactly as closable as it was. Only a still-live
+            // status makes the refusal the answer to give the user.
+            const current = await read();
+            if (
+              current.status === "running" ||
+              current.status === "starting" ||
+              current.status === "stopping"
+            ) {
+              throw cause;
+            }
+          }
+        }
+        await invoke("remove_session", { sessionId });
+        controller.current?.forget(sessionId);
+      } catch (cause) {
+        reportError(sessionErrorMessage(cause));
+      } finally {
+        closing.current.delete(sessionId);
+        setClosingSessionIds(new Set(closing.current));
+      }
+    },
+    [reportError],
+  );
 
   /**
    * Opening an application (#64), and what happened to its own window (#66).
@@ -359,18 +408,21 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
    * be told it rather than left clicking a button that appears to do nothing
    * (story 48). Everything else about the open still arrives as an event.
    */
-  const activate = useCallback(async (sessionId: string): Promise<ActivationOutcomeDto | null> => {
-    try {
-      const raw = await invoke<unknown>("activate_session", { sessionId });
-      if (!isActivationOutcomeDto(raw)) {
-        throw new Error("activate_session 返回了无法识别的载荷");
+  const activate = useCallback(
+    async (sessionId: string): Promise<ActivationOutcomeDto | null> => {
+      try {
+        const raw = await invoke<unknown>("activate_session", { sessionId });
+        if (!isActivationOutcomeDto(raw)) {
+          throw new Error("activate_session 返回了无法识别的载荷");
+        }
+        return raw;
+      } catch (cause) {
+        reportError(sessionErrorMessage(cause));
+        return null;
       }
-      return raw;
-    } catch (cause) {
-      setError(sessionErrorMessage(cause));
-      return null;
-    }
-  }, []);
+    },
+    [reportError],
+  );
 
   /**
    * Answering "which of these is the application?" (#67).
@@ -391,11 +443,11 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
         }
         return raw;
       } catch (cause) {
-        setError(sessionErrorMessage(cause));
+        reportError(sessionErrorMessage(cause));
         return null;
       }
     },
-    [],
+    [reportError],
   );
 
   return useMemo<SessionRegistry>(
@@ -405,6 +457,7 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
       loading,
       live,
       error,
+      errorAt,
       initializationError,
       configReport,
       configReportError,
@@ -431,6 +484,7 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
       loading,
       live,
       error,
+      errorAt,
       initializationError,
       configReport,
       configReportError,

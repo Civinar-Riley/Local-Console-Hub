@@ -16,6 +16,7 @@ function raw(overrides: Partial<ListenerRowDto> & Pick<ListenerRowDto, "port">):
     programPath: "D:\\tools\\nginx.exe",
     attribution: "external",
     sessionId: null,
+    createdAt: "133724480000000000",
     ...overrides,
   };
 }

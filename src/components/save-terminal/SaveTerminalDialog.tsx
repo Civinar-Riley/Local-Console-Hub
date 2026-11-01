@@ -79,11 +79,14 @@ export default function SaveTerminalDialog({ config, onSubmit, onClose }: SaveTe
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      // A save in flight is the one moment the form may not go away: its
+      // refusal is answered on this component, and closing now would drop the
+      // message the user needs (story 31).
+      if (event.key === "Escape" && !submitting) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, submitting]);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -124,7 +127,13 @@ export default function SaveTerminalDialog({ config, onSubmit, onClose }: SaveTe
           <h2 className="dialog__title" id="save-terminal-title">
             保存启动配置
           </h2>
-          <button type="button" className="dialog__close" aria-label="关闭" onClick={onClose}>
+          <button
+            type="button"
+            className="dialog__close"
+            aria-label="关闭"
+            disabled={submitting}
+            onClick={onClose}
+          >
             <X size={14} />
           </button>
         </header>
@@ -203,7 +212,12 @@ export default function SaveTerminalDialog({ config, onSubmit, onClose }: SaveTe
         </div>
 
         <footer className="dialog__foot">
-          <button type="button" className="btn btn--secondary btn--sm" onClick={onClose}>
+          <button
+            type="button"
+            className="btn btn--secondary btn--sm"
+            disabled={submitting}
+            onClick={onClose}
+          >
             取消
           </button>
           <button type="submit" className="btn btn--primary btn--sm" disabled={submitting}>

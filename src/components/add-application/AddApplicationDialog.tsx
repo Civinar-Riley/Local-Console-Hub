@@ -326,11 +326,14 @@ export default function AddApplicationDialog({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      // A save in flight is the one moment the form may not go away: its
+      // refusal is answered on this component, and closing now would drop the
+      // message the user needs (story 31).
+      if (event.key === "Escape" && !submitting) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, submitting]);
 
   /**
    * Ask about the launch method as the user writes it (#66).
@@ -451,7 +454,13 @@ export default function AddApplicationDialog({
           <h2 className="dialog__title" id="add-application-title">
             添加应用
           </h2>
-          <button type="button" className="dialog__close" aria-label="关闭" onClick={onClose}>
+          <button
+            type="button"
+            className="dialog__close"
+            aria-label="关闭"
+            disabled={submitting}
+            onClick={onClose}
+          >
             <X size={14} />
           </button>
         </header>
@@ -762,7 +771,12 @@ export default function AddApplicationDialog({
         </div>
 
         <footer className="dialog__foot">
-          <button type="button" className="btn btn--secondary btn--sm" onClick={onClose}>
+          <button
+            type="button"
+            className="btn btn--secondary btn--sm"
+            disabled={submitting}
+            onClick={onClose}
+          >
             取消
           </button>
           <button
