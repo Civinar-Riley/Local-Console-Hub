@@ -362,6 +362,32 @@ impl Run {
         }
     }
 
+    /// Whether this run still accounts for something alive — its own process,
+    /// or a member of its tree.
+    ///
+    /// The second half matters because the two are not the same question: a
+    /// terminal shell or a service can hand a child off and exit, and the run
+    /// is not over while that child is alive (spec #59 decision 13). A tree
+    /// that cannot be listed is not evidence of an empty one, so it counts as
+    /// alive.
+    fn holds_live_process(&self) -> bool {
+        fn tree_not_empty<T>(listed: Result<Vec<u32>, T>) -> bool {
+            match listed {
+                Ok(pids) => !pids.is_empty(),
+                Err(_) => true,
+            }
+        }
+
+        match self {
+            Run::Process(run) => run.is_running() || tree_not_empty(run.tree_pids()),
+            Run::Terminal(pty) => pty.is_running() || tree_not_empty(pty.tree_pids()),
+            // A standalone run reports its own end only once its tree is empty
+            // (`crate::process::independent`), so its status already covers
+            // the tree.
+            Run::Standalone(run) => run.is_running(),
+        }
+    }
+
     /// End the run, waiting at most `timeout` for a graceful exit.
     ///
     /// The two kinds do not share a ladder, and that is the platform's answer
@@ -1056,7 +1082,8 @@ impl SessionCore {
             .collect()
     }
 
-    /// Running sessions as listener attribution sees them (#98).
+    /// Sessions that still account for a live process, as listener attribution
+    /// sees them (#98).
     ///
     /// A reading only. It does not start, stop, signal, or replace a run.
     /// Each entry is the session id, the process identity already held for
@@ -1064,6 +1091,15 @@ impl SessionCore {
     /// listed is `None`, which attribution treats as unchecked rather than
     /// empty. Members are recorded with the creation time observed now, not
     /// as bare pids.
+    ///
+    /// The gate is the run's own liveness, not the lifecycle status. A run the
+    /// stop ladder has not confirmed gone stays owned by its session in
+    /// `Error`/`Stopping`, and a terminal whose shell exited can still have a
+    /// live child; both are processes the port page must attribute to the
+    /// session — and, for `confirm_end_occupant`, must protect from being ended
+    /// from outside it (#129). A run whose handles outlive an ended process is
+    /// excluded by the same check, so a reused pid cannot be attributed to a
+    /// session that no longer owns anything.
     pub fn listening_processes(&self) -> Vec<crate::listen::SessionProcess> {
         let handles: Vec<(String, Arc<Mutex<SessionState>>)> = lock(&self.sessions)
             .iter()
@@ -1074,12 +1110,9 @@ impl SessionCore {
         for (id, handle) in handles {
             let hold = {
                 let state = lock(&handle);
-                if state.runtime.status != SessionStatus::Running {
-                    continue;
-                }
                 if let Some(adopted) = &state.adopted {
                     ListeningHold::Adopted(adopted.identity)
-                } else if let Some(run) = state.run.clone() {
+                } else if let Some(run) = state.run.clone().filter(|run| run.holds_live_process()) {
                     ListeningHold::Run(run)
                 } else {
                     continue;
@@ -1292,6 +1325,26 @@ impl SessionCore {
                 ));
             }
 
+            // `Error -> Starting` is for a session with nothing left alive. A
+            // failed stop can leave an `Error` that still owns its run, and
+            // starting over would replace that handle — terminating the tree it
+            // accounts for while this lock is held. The recovery is the stop
+            // ladder the `Error -> Stopping` row exists for, or a restart,
+            // which performs one. A start must not quietly do either.
+            if from == SessionStatus::Error
+                && state.run.as_ref().is_some_and(Run::holds_live_process)
+            {
+                return Err(SessionError::failed(
+                    session_id,
+                    "start",
+                    format!(
+                        "session `{session_id}` still owns a live run its last stop could not \
+                         confirm ended; stop or force stop it before starting it again"
+                    ),
+                    Some(SessionStatus::Error),
+                ));
+            }
+
             // The run's identity and its logging are settled before anything
             // is started: the run id and start time are what name its log file
             // (D-011), and a session whose policy cannot be honoured should
@@ -1441,6 +1494,10 @@ impl SessionCore {
                 Err(message) => {
                     state.runtime.status = SessionStatus::Error;
                     state.runtime.pid = None;
+                    // A start that never got a run has no start time. Leaving
+                    // the previous run's here would make `Error` show an
+                    // uptime for a run that does not exist.
+                    state.runtime.started_at = None;
                     state.runtime.run_id = None;
                     state.runtime.pty_attached = false;
                     state.runtime.health = None;
@@ -1703,9 +1760,6 @@ impl SessionCore {
     /// neither state can be interrupted, so there is no honest way to restart
     /// mid-flight.
     pub fn restart(&self, session_id: &str) -> Result<SessionRuntime, SessionError> {
-        let current = self
-            .snapshot(session_id)
-            .ok_or_else(|| SessionError::unknown_session(session_id, "restart"))?;
         // A restart is a stop and a start, so it is owed the same refusal a
         // stop is: the Hub cannot end a run it does not own (#66).
         let handle = self
@@ -1717,7 +1771,19 @@ impl SessionCore {
         require_owned(&handle, session_id, "restart")?;
         require_managed(&handle, session_id, "restart")?;
 
-        if current.status == SessionStatus::Running {
+        // `Error` may still own a live run its stop could not confirm ended
+        // (#125). Starting over would drop that handle — and with it terminate
+        // the tree — inside the start's lock, so the barrier comes first here
+        // too: the same stop before the replacement every restart performs.
+        let (status, live_run) = {
+            let state = lock(&handle);
+            (
+                state.runtime.status,
+                state.run.as_ref().is_some_and(Run::holds_live_process),
+            )
+        };
+        let unsettled = status == SessionStatus::Error && live_run;
+        if status == SessionStatus::Running || unsettled {
             // The barrier. When this returns, nothing of the old run is left.
             self.stop(session_id)?;
         }
@@ -2464,7 +2530,7 @@ impl SessionCore {
                     // for that tree (§61's rule, upheld by #62).
                     SessionStatus::Error => format!(
                         "session `{session_id}` could not confirm that its process tree ended; \
-                         restart it and end it cleanly before removing it"
+                         stop or force stop it before removing it"
                     ),
                     status => format!(
                         "session `{session_id}` is {}; stop it before removing it",
@@ -2479,8 +2545,15 @@ impl SessionCore {
                 ));
             }
         }
-        sessions.remove(session_id);
+        let removed = sessions.remove(session_id);
+        // The registry lock is released before anything that can wait: a
+        // `Pty` or `ManagedProcess` destructor runs the stop ladder, and every
+        // other session's operations need this lock. The local `state` clone is
+        // what keeps the `SessionState` — and those handles inside it — alive
+        // past the guard, so it is dropped last, also outside the lock.
         drop(sessions);
+        drop(removed);
+        drop(state);
 
         self.publish_removed(session_id);
         Ok(())
@@ -4042,7 +4115,7 @@ mod tests {
         );
     }
 
-    /// The port page reads running sessions and nothing else (#98).
+    /// The port page reads sessions that still hold a live process (#98).
     ///
     /// A registered session that has not been started is not a process. A
     /// running one is its pid plus the creation time observed now, and every
@@ -4050,7 +4123,7 @@ mod tests {
     /// The sleeper is the same `ping` the other lifecycle tests use, and it
     /// is force-stopped on the way out — including when an assertion fails.
     #[test]
-    fn listening_processes_follow_the_running_session_only() {
+    fn listening_processes_follow_a_live_run_only() {
         let idle = SessionCore::without_listener();
         assert!(
             idle.listening_processes().is_empty(),
@@ -4106,6 +4179,27 @@ mod tests {
             core.listening_processes().is_empty(),
             "a stopped session is not still offered as an owner"
         );
+    }
+
+    /// A stop the ladder could not confirm leaves the session in `Error` while
+    /// it still owns the run (#125). That run is what the port page has to
+    /// attribute, and what `confirm_end_occupant` has to protect from being
+    /// ended outside the session (#129).
+    #[test]
+    fn an_error_session_that_still_owns_its_run_is_still_listed() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let runtime = core.start("svc").expect("start succeeds");
+        let pid = runtime.pid.expect("a running session has a pid");
+        {
+            let handle = core.handle("svc").expect("registered");
+            lock(&handle).runtime.status = SessionStatus::Error;
+        }
+
+        let listed = core.listening_processes();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].identity.pid(), pid);
+
+        core.force_stop("svc").expect("cleanup");
     }
 
     /// The listener has to see `Starting` before `Running`: a UI that only
@@ -4869,6 +4963,97 @@ mod tests {
             sink.names()
         );
         assert_eq!(core.summary().error, 1);
+    }
+
+    /// A failed start has no start time, so the previous run's must not linger
+    /// on the snapshot (#127).
+    #[test]
+    fn a_start_that_fails_does_not_keep_the_previous_runs_start_time() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let first = core.start("svc").expect("start succeeds");
+        assert!(first.started_at.is_some());
+        core.force_stop("svc").expect("stop succeeds");
+        {
+            let handle = core.handle("svc").expect("registered");
+            lock(&handle).config.command =
+                Some("definitely-not-a-real-program-lch --serve".to_owned());
+        }
+
+        let error = core.start("svc").expect_err("the spawn fails");
+        assert_eq!(error.kind, SessionErrorKind::Failed);
+
+        let runtime = core.snapshot("svc").expect("registered");
+        assert_eq!(runtime.status, SessionStatus::Error);
+        assert_eq!(
+            runtime.started_at, None,
+            "a start that never got a run has no start time"
+        );
+    }
+
+    /// `Error -> Stopping` is the recovery path (#125): a session whose stop
+    /// could not confirm the tree is gone still owns the run, and the stop
+    /// ladder must be available to try again.
+    #[test]
+    fn an_error_run_can_still_be_stopped() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let running = core.start("svc").expect("start succeeds");
+        let pid = running.pid.expect("a running session has a pid");
+        {
+            let handle = core.handle("svc").expect("registered");
+            lock(&handle).runtime.status = SessionStatus::Error;
+        }
+
+        let stopped = core.stop("svc").expect("the recovery stop succeeds");
+        assert!(
+            matches!(
+                stopped.status,
+                SessionStatus::Stopped | SessionStatus::Exited
+            ),
+            "the run ended: {}",
+            stopped.status.as_str()
+        );
+        assert_eq!(stopped.pid, None);
+        assert!(!pid_is_alive(pid));
+    }
+
+    /// The restart from that same `Error` ends the owned run before it starts
+    /// the replacement. Starting first would drop the old handle — and with it
+    /// terminate its tree — inside the start's lock.
+    #[test]
+    fn restart_from_an_error_ends_the_owned_run_first() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let first = core.start("svc").expect("start succeeds");
+        let first_pid = first.pid.expect("a running session has a pid");
+        {
+            let handle = core.handle("svc").expect("registered");
+            lock(&handle).runtime.status = SessionStatus::Error;
+        }
+
+        let second = core.restart("svc").expect("restart recovers the session");
+        assert_eq!(second.status, SessionStatus::Running);
+        let second_pid = second.pid.expect("the replacement has a pid");
+        assert_ne!(second_pid, first_pid);
+        assert!(!pid_is_alive(first_pid), "the previous run was ended");
+
+        core.force_stop("svc").expect("cleanup");
+    }
+
+    /// A start must not replace a run the session still owns: the recovery is
+    /// an explicit stop, or the restart that performs one.
+    #[test]
+    fn starting_an_error_session_that_still_owns_its_run_is_refused() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        core.start("svc").expect("start succeeds");
+        {
+            let handle = core.handle("svc").expect("registered");
+            lock(&handle).runtime.status = SessionStatus::Error;
+        }
+
+        let error = core.start("svc").expect_err("refused");
+        assert_eq!(error.kind, SessionErrorKind::Failed);
+        assert!(error.message.contains("stop"), "message: {error}");
+
+        core.force_stop("svc").expect("cleanup");
     }
 
     /// Poll until the session reaches `want`, so a test asserts on the state

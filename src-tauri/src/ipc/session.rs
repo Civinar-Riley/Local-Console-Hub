@@ -111,7 +111,7 @@ pub fn list_session_configs(core: State<'_, SessionCore>) -> Vec<SessionConfigDt
 /// the directory an external entry asked for; the session layer decides what
 /// an absent one means (the user's home directory) rather than this thin
 /// command doing it (spec #59 decision 5).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_temporary_terminal(
     core: State<'_, SessionCore>,
     cwd: Option<String>,
@@ -134,7 +134,7 @@ pub fn create_temporary_terminal(
 /// The file to write is taken from the startup report, which is where the app
 /// records the path it actually read — not from `AppPaths::from_env()` again,
 /// which could resolve differently from the file the registry was built from.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_application(
     core: State<'_, SessionCore>,
     report: State<'_, ConfigReportDto>,
@@ -151,7 +151,7 @@ pub fn add_application(
 /// the name typed above it (spec #59 decision 9). It is a read-only question:
 /// nothing is resolved to a *running* program, and a launch method this build
 /// cannot confirm comes back unrecommended with the reason why.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn recommend_display(command: String, cwd: Option<String>) -> DisplayAdviceDto {
     DisplayAdviceDto::from(crate::app::recommend::advise(&command, cwd.as_deref()))
 }
@@ -195,7 +195,7 @@ impl From<crate::app::recommend::DisplayAdvice> for DisplayAdviceDto {
 ///
 /// The file to write comes from the startup report for the same reason
 /// [`add_application`] does: it records the file this process actually read.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_terminal_config(
     core: State<'_, SessionCore>,
     report: State<'_, ConfigReportDto>,
@@ -220,7 +220,7 @@ pub fn save_terminal_config(
 /// a lifecycle, and the same composition answers a launch request handed to the
 /// Hub from a shortcut, so the two entries cannot disagree about what "open"
 /// means.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn activate_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -239,7 +239,7 @@ pub fn activate_session(
 /// re-verified rather than trusted: what came back describes a moment that has
 /// passed, and `app::activation::associate` is where that is turned back into a
 /// statement about a process that exists now.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_session_open(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -449,7 +449,7 @@ impl From<crate::app::activation::OpenOutcome> for ActivationDto {
 /// Session Core refuses a configured session (that one lives in the config
 /// file) and a live one (its process tree is still owned by its handle), so
 /// this command cannot be used as a way to stop something by deleting it.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -473,7 +473,7 @@ pub fn get_session(
 }
 
 /// Start a session.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn start_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -482,7 +482,7 @@ pub fn start_session(
 }
 
 /// Stop a session, giving it the default grace period to unwind.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stop_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -491,7 +491,7 @@ pub fn stop_session(
 }
 
 /// Terminate a session's run without waiting for it to unwind.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn force_stop_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -500,7 +500,7 @@ pub fn force_stop_session(
 }
 
 /// Replace a session's run with a fresh one.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restart_session(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -515,7 +515,7 @@ pub fn restart_session(
 /// machine anywhere the user did not configure. A session without a `url` is
 /// refused with what to add, rather than opening nothing (`crate::shell`'s note,
 /// `docs/DECISIONS.md` D-021).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_session_url(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -531,7 +531,7 @@ pub fn open_session_url(
 /// is resolved from the session, so this is not a general "open a folder"
 /// command. A session with no `cwd`, or one whose folder has since been deleted,
 /// is reported with an actionable message.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_session_cwd(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -542,7 +542,7 @@ pub fn open_session_cwd(
 }
 
 /// Remove a saved launch entry; application files and disk logs are retained.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_application(
     core: State<'_, SessionCore>,
     report: State<'_, ConfigReportDto>,

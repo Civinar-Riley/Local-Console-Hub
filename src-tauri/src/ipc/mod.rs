@@ -10,6 +10,19 @@
 //! service-action commands (T04, T08), the logging read/action commands (T05),
 //! the terminal commands (T07), the logs view's file and retention commands
 //! (T10) and the launch request a shortcut made (#63).
+//!
+//! ## Only in-memory reads stay on the main thread
+//!
+//! A command without `async` runs on the main thread, which is the window's
+//! event loop. That is fine for a snapshot or a config lookup, and wrong for
+//! everything that waits: a stop that cannot make a tree unwind spends up to
+//! ~20s in the stop ladder, a shell handoff waits for its window, and a
+//! listener refresh reads the OS tables. `#[tauri::command(async)]` moves
+//! those calls to Tauri's async runtime, so the window and the tray keep
+//! rendering the `Stopping` state the call just published. Commands that only
+//! read memory (`list_sessions`, `get_session`, the terminal attach/write/
+//! resize trio) stay synchronous; terminal input in particular must keep
+//! arriving in the order the user produced it.
 
 // `generate_handler!` resolves each command through hidden items the macro
 // emits beside the function, so commands are registered by their own module

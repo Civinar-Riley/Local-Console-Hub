@@ -61,7 +61,7 @@ pub struct ListenerListDto {
 }
 
 /// List listening ports and who holds each one.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_listeners(core: State<'_, SessionCore>) -> ListenerListDto {
     listeners_from(core.inner())
 }
@@ -159,7 +159,7 @@ pub struct PortOccupancyDto {
 /// The window calls this first. Continuing is a later `activate_session`;
 /// cancelling sends nothing here and nothing afterwards. This command does not
 /// start the session, stop another session, or end the occupying process.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn port_occupancy(
     core: State<'_, SessionCore>,
     session_id: String,

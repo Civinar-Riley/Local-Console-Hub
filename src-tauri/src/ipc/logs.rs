@@ -31,7 +31,7 @@ use super::hand_over_failed;
 
 /// What this session's logging is doing, and where it writes
 /// (`docs/LOGGING.md` §1.4).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_log_info(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -50,14 +50,14 @@ pub fn get_log_info(
 /// sweeps log files and never the record of the run that wrote them
 /// (`docs/LOGGING.md` §9), so a row has to be able to say "this run's log was
 /// cleaned up" rather than offering an action that fails.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_run_history(core: State<'_, SessionCore>, session_id: String) -> RunHistory {
     core.run_history(&session_id)
 }
 
 /// Commit the current run's `on_error` log now, instead of waiting to see how
 /// the run ends (`docs/LOGGING.md` §3).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_run_log(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -67,7 +67,7 @@ pub fn save_run_log(
 
 /// Turn recording on or off for a `manual` session's current run
 /// (`docs/LOGGING.md` §3).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_log_recording(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -83,7 +83,7 @@ pub fn set_log_recording(
 /// current file is opened — what it is writing now, or what its last run left
 /// behind. A session that persists nothing answers with the reason its policy
 /// gives rather than with an empty success.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_log_file(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -100,7 +100,7 @@ pub fn open_log_file(
 /// `external` session's log belongs to the application (`docs/DECISIONS.md`
 /// D-005), and sending a user to the Hub's own directory to look for it would
 /// be showing them an empty folder as if it were the answer.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_log_folder(
     core: State<'_, SessionCore>,
     session_id: String,
@@ -117,7 +117,7 @@ pub fn open_log_folder(
 /// bytes it would take before the user agrees to it. Answers with an empty
 /// report for a session with nothing past keeping, so "nothing to clean" is not
 /// a failure.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn preview_log_cleanup(core: State<'_, SessionCore>, session_id: String) -> CleanupReport {
     core.cleanup_preview(Some(&session_id))
 }
@@ -129,7 +129,7 @@ pub fn preview_log_cleanup(core: State<'_, SessionCore>, session_id: String) -> 
 /// application-owned log linked with `source: external` lives elsewhere and is
 /// never touched, and neither is another session's history. What was removed,
 /// how much was freed, and what the OS refused all come back in the report.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cleanup_logs(core: State<'_, SessionCore>, session_id: String) -> CleanupReport {
     core.cleanup_logs(Some(&session_id))
 }

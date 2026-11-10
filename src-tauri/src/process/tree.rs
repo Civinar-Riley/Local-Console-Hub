@@ -26,7 +26,9 @@
 use std::cell::Cell;
 use std::mem::size_of;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
@@ -34,8 +36,16 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
-/// Processes reported per tree query.
-const MAX_TREE_PROCESSES: usize = 512;
+/// Processes one tree query asks for. A typical session's tree is far smaller;
+/// this is the first guess, not a ceiling.
+const INITIAL_TREE_PROCESSES: usize = 512;
+
+/// The largest tree this layer will describe in one query.
+///
+/// A tree beyond this is not a tree the Hub can stop usefully, and an
+/// unbounded retry loop against an object whose counter never settles is worse
+/// than a clear failure. 65,536 ids is 512 KiB of the query buffer.
+const MAX_TREE_PROCESSES: usize = 65_536;
 
 #[cfg(test)]
 thread_local! {
@@ -177,37 +187,74 @@ impl Job {
     /// Processes currently assigned to the job, including the run's own
     /// process.
     ///
-    /// The OS reports at most [`MAX_TREE_PROCESSES`] ids per query, so a larger
-    /// tree is truncated. Emptiness — the property a stop barrier relies on —
-    /// is still reported faithfully.
+    /// A tree larger than [`INITIAL_TREE_PROCESSES`] is read by growing the
+    /// query buffer to what the OS says it needs, up to
+    /// [`MAX_TREE_PROCESSES`]. A buffer that is merely too small is not a
+    /// failure: treating `ERROR_MORE_DATA` as one would make a large tree
+    /// impossible to confirm ended — and the stop ladder asks this question
+    /// precisely to confirm the tree is gone.
     pub fn pids(&self) -> Result<Vec<u32>, String> {
-        // The id list is variable-length: two `u32` counters followed by the
-        // entries. Sizing the buffer in `usize` units keeps it aligned for
-        // them.
-        let mut buffer = vec![0usize; 1 + MAX_TREE_PROCESSES];
-        let mut returned_bytes: u32 = 0;
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.0 as _,
-                JobObjectBasicProcessIdList,
-                buffer.as_mut_ptr().cast(),
-                (buffer.len() * size_of::<usize>()) as u32,
-                &mut returned_bytes,
-            )
-        };
-        if queried == 0 {
-            return Err(last_error("QueryInformationJobObject"));
-        }
+        let mut capacity = INITIAL_TREE_PROCESSES;
+        loop {
+            // The id list is variable-length: two `u32` counters followed by
+            // the entries. Sizing the buffer in `usize` units keeps it aligned
+            // for them.
+            let mut buffer = vec![0usize; 1 + capacity];
+            let mut returned_bytes: u32 = 0;
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.0 as _,
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * size_of::<usize>()) as u32,
+                    &mut returned_bytes,
+                )
+            };
 
-        let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-        // An id list is variable-length: the OS reports how many entries are
-        // valid.
-        let listed = list.NumberOfProcessIdsInList as usize;
-        let count = listed.min(MAX_TREE_PROCESSES);
-        let first = list.ProcessIdList.as_ptr();
-        let ids = (0..count).map(|index| unsafe { *first.add(index) as u32 });
-        Ok(ids.collect())
+            if queried != 0 {
+                let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+                // An id list is variable-length: the OS reports how many
+                // entries are valid.
+                let listed = list.NumberOfProcessIdsInList as usize;
+                let count = listed.min(capacity);
+                let first = list.ProcessIdList.as_ptr();
+                let ids = (0..count).map(|index| unsafe { *first.add(index) as u32 });
+                return Ok(ids.collect());
+            }
+
+            let code = unsafe { GetLastError() };
+            if !matches!(code, ERROR_MORE_DATA | ERROR_INSUFFICIENT_BUFFER) {
+                return Err(last_error("QueryInformationJobObject"));
+            }
+
+            // The header is filled even when the list did not fit, so the
+            // job's own count is the exact size to try next. A driver that
+            // leaves it empty falls back to doubling.
+            let reported = unsafe {
+                let list = &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+                list.NumberOfAssignedProcesses as usize
+            };
+            let Some(next) = next_tree_capacity(capacity, reported) else {
+                return Err(format!(
+                    "the job lists more than {MAX_TREE_PROCESSES} processes (Win32 error {code} \
+                     from QueryInformationJobObject)"
+                ));
+            };
+            capacity = next;
+        }
     }
+}
+
+/// The buffer size for another query, or `None` when the tree cannot fit.
+///
+/// The reported count is exact when the OS filled the header; doubling is
+/// what guarantees progress when it did not (or when the tree grew between
+/// the two queries).
+fn next_tree_capacity(current: usize, reported: usize) -> Option<usize> {
+    let next = reported
+        .max(current.saturating_mul(2))
+        .min(MAX_TREE_PROCESSES);
+    (next > current).then_some(next)
 }
 
 impl Drop for Job {
@@ -228,4 +275,25 @@ impl Drop for Job {
 fn last_error(call: &str) -> String {
     let code = unsafe { GetLastError() };
     format!("Win32 error {code} from {call}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_tree_capacity, MAX_TREE_PROCESSES};
+
+    #[test]
+    fn a_full_buffer_grows_to_what_the_os_reported() {
+        assert_eq!(next_tree_capacity(512, 2_000), Some(2_000));
+    }
+
+    #[test]
+    fn an_empty_report_still_doubles() {
+        assert_eq!(next_tree_capacity(512, 0), Some(1_024));
+    }
+
+    #[test]
+    fn growth_stops_at_the_ceiling() {
+        assert_eq!(next_tree_capacity(32_768, 90_000), Some(MAX_TREE_PROCESSES));
+        assert_eq!(next_tree_capacity(MAX_TREE_PROCESSES, 90_000), None);
+    }
 }
