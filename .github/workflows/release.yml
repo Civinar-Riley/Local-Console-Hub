@@ -74,9 +74,16 @@ jobs:
           )
           if ($files.Count -eq 0) { throw "no installer was produced" }
           $lines = foreach ($file in $files) {
-            "$((Get-FileHash $file -Algorithm SHA256).Hash.ToLower())  $($file.Name)"
+            # GitHub replaces the spaces in an asset name with dots; the
+            # checksum file has to name what a download actually produces.
+            $name = $file.Name -replace ' ', '.'
+            "$((Get-FileHash $file -Algorithm SHA256).Hash.ToLower())  $name"
           }
-          $lines | Set-Content -Encoding ascii SHA256SUMS.txt
+          [System.IO.File]::WriteAllText(
+            "SHA256SUMS.txt",
+            ($lines -join "`n") + "`n",
+            [System.Text.Encoding]::ASCII
+          )
           Get-Content SHA256SUMS.txt
 
       - name: Upload the build as a workflow artifact
