@@ -18,7 +18,8 @@
 
 已有版本先通过托盘菜单 **退出**，再安装；只关闭主窗口会继续在后台运行。建议继续使用原来的安装包类型和目录，并先备份配置与日志。
 
-[安装与使用教程](USER_GUIDE.md) · [尚未纳入的部分](NEXT_VERSION.md)。
+[安装与使用教程](https://github.com/Civinar-Riley/Local-Console-Hub/blob/v0.3.0/docs/USER_GUIDE.md) ·
+[尚未纳入的部分](https://github.com/Civinar-Riley/Local-Console-Hub/blob/v0.3.0/docs/NEXT_VERSION.md)。
 
 ## 验证与已知限制
 
