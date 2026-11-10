@@ -26,6 +26,7 @@
 //! over the target, so a failure at any point leaves the original exactly as
 //! it was — the user's file is never opened for truncation.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
@@ -581,6 +582,12 @@ fn read_optional(path: &Path) -> Result<Option<String>, SaveError> {
 /// The original is never opened for writing, so a failure anywhere leaves it
 /// byte-for-byte as it was — including the case the decision cares about most,
 /// a permission error on the target.
+///
+/// The temporary is flushed to the disk before the rename. NTFS makes the
+/// rename itself atomic, but it does not promise the new file's *data* is on
+/// disk at that point: without the sync, a power loss could leave a
+/// `config.yaml` that exists and is empty or half written. The config file is
+/// every saved launch entry the user has, so the barrier is worth the call.
 fn write_atomically(path: &Path, contents: &str) -> Result<(), SaveError> {
     let directory = path
         .parent()
@@ -595,7 +602,14 @@ fn write_atomically(path: &Path, contents: &str) -> Result<(), SaveError> {
         .unwrap_or_else(|| "config.yaml".to_owned());
     let temp = directory.join(format!(".{name}.{}.tmp", unique_suffix()));
 
-    if let Err(error) = std::fs::write(&temp, contents) {
+    let written = std::fs::File::create(&temp).and_then(|file| {
+        let mut writer = std::io::BufWriter::new(&file);
+        writer.write_all(contents.as_bytes())?;
+        writer.flush()?;
+        drop(writer);
+        file.sync_all()
+    });
+    if let Err(error) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(SaveError::Io(error));
     }

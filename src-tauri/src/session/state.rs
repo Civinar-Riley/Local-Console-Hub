@@ -62,8 +62,14 @@ impl SessionStatus {
     /// Running  -> Stopping | Exited | Error
     /// Stopping -> Exited | Stopped | Error
     /// Exited   -> Starting
-    /// Error    -> Starting
+    /// Error    -> Starting | Stopping
     /// ```
+    ///
+    /// `Error -> Stopping` is the recovery path, not an ordinary stop: a stop
+    /// that could not confirm the tree was gone leaves the run owned by the
+    /// session, and the stop ladder is the one action that can still end it.
+    /// Without the pair, "force stop" would be unavailable exactly when a
+    /// process tree refuses to die.
     ///
     /// Everything else is rejected, including the transitions that look
     /// harmless but are not listed (`Stopped -> Running`, `Started`-while-
@@ -77,7 +83,8 @@ impl SessionStatus {
                 | (Starting, Running | Error)
                 | (Running, Stopping | Exited | Error)
                 | (Stopping, Exited | Stopped | Error)
-                | (Exited | Error, Starting)
+                | (Error, Starting | Stopping)
+                | (Exited, Starting)
         )
     }
 }
@@ -104,6 +111,7 @@ mod tests {
         (Stopping, Error),
         (Exited, Starting),
         (Error, Starting),
+        (Error, Stopping),
     ];
 
     #[test]

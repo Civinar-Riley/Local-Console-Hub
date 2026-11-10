@@ -30,7 +30,7 @@
 
 #[cfg(test)]
 use crate::process::tree::{fail_start_step, StartFailurePointForTest};
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
@@ -508,18 +508,32 @@ impl Drop for AttributeList {
 /// are talking to (`TERM` is a property of the terminal host, not a policy of
 /// whoever started the session).
 fn environment_block() -> Vec<u16> {
-    let mut block: Vec<u16> = Vec::new();
-    for (key, value) in std::env::vars_os() {
-        if key.as_os_str() == OsStr::new("TERM") {
-            continue; // replaced by the layer's own value below
-        }
+    environment_block_from(std::env::vars_os())
+}
+
+/// The block for `variables`, with this layer's own terminal identity in it.
+///
+/// `CreateProcessW` documents the block as sorted by variable name,
+/// case-insensitively, and a program that merges or displays its environment
+/// in arrival order notices when it is not. The injection replaces any
+/// inherited `TERM` rather than sitting beside it: Windows variable names are
+/// case-insensitive, so a `term` or `Term` from whoever launched the Hub would
+/// otherwise be a second variable the console host could pick over this one.
+fn environment_block_from(variables: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
+    let mut entries: Vec<(OsString, OsString)> = variables
+        .into_iter()
+        .filter(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case("TERM"))
+        .collect();
+    entries.push((OsString::from("TERM"), OsString::from("xterm-256color")));
+    entries.sort_by_cached_key(|(key, _)| key.to_string_lossy().to_uppercase());
+
+    let mut block = Vec::new();
+    for (key, value) in entries {
         block.extend(key.encode_wide());
         block.push('=' as u16);
         block.extend(value.encode_wide());
         block.push(0);
     }
-    block.extend("TERM=xterm-256color".encode_utf16());
-    block.push(0);
     block.push(0); // the block ends with an empty entry
     block
 }
@@ -535,10 +549,15 @@ fn wide_command_line(program: &Path, args: &[String]) -> Vec<u16> {
     line.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Quote one argv entry for a `CreateProcessW` command line. An entry is quoted
-/// when it is empty or contains a space, tab or quote; embedded quotes are
-/// backslash-escaped. (Full MSVCRT quoting rules are not implemented — the
-/// Hub's own configuration is the argv source, not an arbitrary shell line.)
+/// Quote one argv entry for a `CreateProcessW` command line, following the
+/// MSVCRT rules the C runtime uses to split it back into argv.
+///
+/// An entry needs quoting when it is empty or contains a space, tab or quote.
+/// Inside the quotes a run of `n` backslashes before a `"` becomes `2n + 1`
+/// backslashes, so the quote stays a literal quote rather than the closing
+/// one; a run at the end of the entry becomes `2n` so the closing quote is not
+/// swallowed either. That second rule is what makes an ordinary path with a
+/// trailing backslash (`D:\My Dir\`) survive a round trip.
 fn quote_argument(argument: &str) -> String {
     let tricky = argument.is_empty()
         || argument
@@ -547,14 +566,26 @@ fn quote_argument(argument: &str) -> String {
     if !tricky {
         return argument.to_owned();
     }
+
     let mut quoted = String::with_capacity(argument.len() + 2);
     quoted.push('"');
+    let mut backslashes = 0usize;
     for character in argument.chars() {
-        if character == '"' {
-            quoted.push('\\');
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                quoted.push(character);
+                backslashes = 0;
+            }
         }
-        quoted.push(character);
     }
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
     quoted.push('"');
     quoted
 }
@@ -566,4 +597,55 @@ fn quote_argument(argument: &str) -> String {
 fn last_error(call: &str) -> String {
     let code = unsafe { GetLastError() };
     format!("Win32 error {code} from {call}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{environment_block_from, quote_argument};
+    use std::ffi::OsString;
+
+    /// The cases that make the backslash rules observable: a path with a
+    /// space and a trailing backslash, and the same path with a literal quote
+    /// after it.
+    #[test]
+    fn quote_argument_follows_the_msvcrt_backslash_rules() {
+        assert_eq!(quote_argument("hello"), "hello");
+        assert_eq!(quote_argument("hello world"), r#""hello world""#);
+        assert_eq!(quote_argument(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_argument(r"D:\My Dir\"), r#""D:\My Dir\\""#);
+        assert_eq!(quote_argument(r#"D:\My Dir\""#), r#""D:\My Dir\\\"""#);
+        assert_eq!(quote_argument(""), r#""""#);
+        assert_eq!(quote_argument(r"C:\"), r"C:\");
+        assert_eq!(quote_argument("a b\\\\"), r#""a b\\\\""#);
+    }
+
+    #[test]
+    fn the_environment_block_replaces_term_case_insensitively_and_sorts() {
+        let block = environment_block_from(vec![
+            (OsString::from("term"), OsString::from("dumb")),
+            (OsString::from("Path"), OsString::from(r"C:\Windows")),
+            (OsString::from("TERM"), OsString::from("vt100")),
+            (OsString::from("Alpha"), OsString::from("1")),
+        ]);
+
+        let entries: Vec<String> = block
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf16(entry).expect("the block is UTF-16"))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                "Alpha=1".to_owned(),
+                r"Path=C:\Windows".to_owned(),
+                "TERM=xterm-256color".to_owned(),
+            ],
+            "one TERM, in the order CreateProcessW documents"
+        );
+        assert_eq!(
+            block[block.len() - 2],
+            0,
+            "the block ends with an empty entry"
+        );
+    }
 }

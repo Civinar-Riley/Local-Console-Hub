@@ -1,7 +1,7 @@
 //! Window command for one managed session's CPU and memory (#108).
 //!
 //! The command reads. It does not start a session, stop one, or end a process
-//! in the tree. A session that is not running — or whose process no longer
+//! in the tree. A session that holds no live run — or whose process no longer
 //! has the creation time the session holds — comes back with no check time and
 //! no members. That empty list is not a resource table, and it is not an
 //! earlier reading restamped as a check that just finished.
@@ -48,7 +48,7 @@ pub struct SessionResourcesDto {
 ///
 /// The window asks when the user looks. Cancelling sends nothing. This
 /// command does not stop the session or any process it finds.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn session_resources(core: State<'_, SessionCore>, session_id: String) -> SessionResourcesDto {
     resources_for(core.inner(), &session_id)
 }

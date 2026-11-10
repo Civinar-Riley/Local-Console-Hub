@@ -230,7 +230,14 @@ Running -> Error
 Stopping -> Error
 Exited -> Starting
 Error -> Starting
+Error -> Stopping
 ~~~
+
+`Error -> Stopping` is the recovery path for a stop that could not confirm the
+run's process tree was gone. That `Error` still owns the run (the handle is what
+accounts for a tree that may be alive), so retrying the stop ladder — including
+force stop — must be possible; otherwise the only way out would be a restart,
+which would have to launch a second run while the first tree is unaccounted for.
 
 One move is deliberately **not** in this table: a session with nothing of the
 Hub's running may become `Running` because the user associated an instance they

@@ -32,7 +32,7 @@ pub struct ConfirmEndDto {
 /// End the confirmed process tree, or explain that nothing was ended (#110).
 ///
 /// Cancelling never calls this. Refresh, start, and restart do not either.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn confirm_end_occupant(
     core: State<'_, SessionCore>,
     pid: u32,
