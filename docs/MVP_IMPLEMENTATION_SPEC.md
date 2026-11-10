@@ -418,6 +418,14 @@ appended entry, and registers the session so the window lists it immediately.
 It carries the two display dimensions (#66) when the user chose them, and
 omits them when the form was left alone.
 
+`update_application` is that entry's edit half: the same form, opened on what
+the file holds, validated the same way, and applied to the registered session
+and to its one block in `config.yaml`. The session id is not editable — it
+keys the registry, the file and the log directory — and every other key the
+build does not know stays in place. The edit is refused while the session still
+has a live run: the configuration is what the run was started from, and the
+changed values apply to the next start.
+
 `recommend_display` is the form's one read-only question (#66): given a
 command and a working directory, it answers what this build can *confirm*
 about that launch method's display — the executable the command resolves to,

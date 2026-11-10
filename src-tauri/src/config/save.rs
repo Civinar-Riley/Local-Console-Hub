@@ -214,6 +214,21 @@ pub fn remove_saved_session(path: &Path, id: &str) -> Result<(), SaveError> {
     replace(path, original, &updated)
 }
 
+/// Replace exactly one block entry without rewriting unrelated YAML.
+///
+/// The entry is identified by `id`; every field of the new entry replaces the
+/// old one, while keys this build does not know are kept (see
+/// [`update_session_text`]).
+pub fn update_saved_session(
+    path: &Path,
+    id: &str,
+    entry: &RawSessionConfig,
+) -> Result<(), SaveError> {
+    let original = read_optional(path)?;
+    let updated = update_session_text(original.as_deref().unwrap_or(""), id, entry)?;
+    replace(path, original, &updated)
+}
+
 pub fn remove_session_text(text: &str, id: &str) -> Result<String, SaveError> {
     let Shape::Sessions { item_indent } = scan(text)? else {
         return Err(SaveError::Unsafe("没有可移除的配置项".to_owned()));
@@ -235,20 +250,7 @@ pub fn remove_session_text(text: &str, id: &str) -> Result<String, SaveError> {
             "配置项不存在或 ID 重复；未做任何修改".to_owned(),
         ));
     }
-    let starts: Vec<_> = significant_lines(text)
-        .into_iter()
-        .filter(|(_, line)| {
-            let trimmed = line.trim_start();
-            line.len() - trimmed.len() == item_indent
-                && (trimmed == "-" || trimmed.starts_with("- "))
-        })
-        .map(|(offset, _)| offset)
-        .collect();
-    if starts.len() != entries.len() {
-        return Err(SaveError::Unsafe(
-            "无法安全定位配置项；请手动检查配置文件".to_owned(),
-        ));
-    }
+    let starts = item_starts(text, entries.len(), item_indent)?;
     let index = matches[0];
     let start = starts[index];
     let end = starts.get(index + 1).copied().unwrap_or(text.len());
@@ -285,6 +287,190 @@ pub fn remove_session_text(text: &str, id: &str) -> Result<String, SaveError> {
     Ok(updated)
 }
 
+/// The document with the entry `id` replaced by `entry`, or the reason it
+/// cannot be.
+///
+/// Only that one block is rewritten: other entries, their order and every
+/// comment outside the block are left byte-for-byte. Inside the block,
+/// comment-only lines survive (they follow the rewritten fields); an inline
+/// comment on a field line does not, because that line is what the edit
+/// replaces.
+///
+/// Fields this build does not know are kept: the new entry is overlaid on the
+/// mapping already in the file, so an edit cannot delete a key a newer version
+/// wrote. A field the form cleared is removed, which is what makes an optional
+/// value clearable from the window.
+pub fn update_session_text(
+    text: &str,
+    id: &str,
+    entry: &RawSessionConfig,
+) -> Result<String, SaveError> {
+    fn not_found(id: &str) -> SaveError {
+        SaveError::Unsafe(format!("a session with the id `{id}` is not defined there"))
+    }
+
+    let Shape::Sessions { item_indent } = scan(text)? else {
+        return Err(not_found(id));
+    };
+    let document: Value =
+        serde_yaml::from_str(text).map_err(|error| SaveError::Unparsable(error.to_string()))?;
+    let entries = document
+        .get("sessions")
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| not_found(id))?;
+    let matches: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.get("id").and_then(Value::as_str) == Some(id))
+        .map(|(index, _)| index)
+        .collect();
+    let index = match matches.as_slice() {
+        [] => return Err(not_found(id)),
+        [index] => *index,
+        _ => return Err(SaveError::Unsafe("配置项 ID 重复；未做任何修改".to_owned())),
+    };
+
+    let starts = item_starts(text, entries.len(), item_indent)?;
+    let start = starts[index];
+    let end = starts.get(index + 1).copied().unwrap_or(text.len());
+    let old = entries[index]
+        .as_mapping()
+        .ok_or_else(|| SaveError::Unsafe("配置项不是映射；请手动检查配置文件".to_owned()))?;
+    let merged = merge_known_fields(old, entry);
+
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let block = &text[start..end];
+    // Everything after the old entry's last field — blank lines before the
+    // next item, notes that follow it — is preserved as it was. Comments
+    // between the fields are kept too, after the rewritten block.
+    let trailing_at = last_significant_line_end(block);
+    let suffix = &block[trailing_at..];
+    let comments = interior_comments(block, trailing_at);
+    let mut replacement = render_mapping_item(&merged, item_indent, newline)?;
+    let comment_pad = " ".repeat(item_indent + 2);
+    for comment in comments {
+        replacement.push_str(&comment_pad);
+        replacement.push_str(&comment);
+        replacement.push_str(newline);
+    }
+    replacement.push_str(suffix);
+
+    let updated = format!("{}{}{}", &text[..start], replacement, &text[end..]);
+
+    let mut expected = document;
+    expected
+        .get_mut("sessions")
+        .and_then(Value::as_sequence_mut)
+        .and_then(|entries| entries.get_mut(index))
+        .map(|slot| *slot = merged)
+        .ok_or_else(|| SaveError::Unsafe("无法定位配置项；请手动检查配置文件".to_owned()))?;
+    let actual: Value =
+        serde_yaml::from_str(&updated).map_err(|error| SaveError::Unparsable(error.to_string()))?;
+    if actual != expected {
+        return Err(SaveError::Unsafe(
+            "编辑会影响其他配置内容；未做任何修改".to_owned(),
+        ));
+    }
+    Ok(updated)
+}
+
+/// Byte offsets of the document's list items.
+///
+/// The text is what decides where the blocks begin, so the count has to agree
+/// with the parsed list; when it does not, this build cannot tell which text
+/// belongs to which entry and refuses rather than guessing.
+fn item_starts(text: &str, entries: usize, item_indent: usize) -> Result<Vec<usize>, SaveError> {
+    let starts: Vec<_> = significant_lines(text)
+        .into_iter()
+        .filter(|(_, line)| {
+            let trimmed = line.trim_start();
+            line.len() - trimmed.len() == item_indent
+                && (trimmed == "-" || trimmed.starts_with("- "))
+        })
+        .map(|(offset, _)| offset)
+        .collect();
+    if starts.len() != entries {
+        return Err(SaveError::Unsafe(
+            "无法安全定位配置项；请手动检查配置文件".to_owned(),
+        ));
+    }
+    Ok(starts)
+}
+
+/// The offset just past the last line of `block` that carries structure.
+fn last_significant_line_end(block: &str) -> usize {
+    let mut offset = 0;
+    let mut end = 0;
+    for line in block.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            end = offset + line.len();
+        }
+        offset += line.len();
+    }
+    end
+}
+
+/// Comment-only lines between the item's first and last significant lines.
+fn interior_comments(block: &str, significant_end: usize) -> Vec<String> {
+    let mut comments = Vec::new();
+    let mut offset = 0;
+    for line in block.split_inclusive('\n') {
+        if offset >= significant_end {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            comments.push(trimmed.to_owned());
+        }
+        offset += line.len();
+    }
+    comments
+}
+
+/// The entry fields an edit owns.
+///
+/// A key outside this list is either hand-written documentation or a field a
+/// newer build understands; neither is something this build may delete, so
+/// [`merge_known_fields`] leaves it alone.
+const ENTRY_FIELDS: [&str; 14] = [
+    "id",
+    "name",
+    "type",
+    "cwd",
+    "command",
+    "url",
+    "port",
+    "purpose",
+    "close_impact",
+    "shell",
+    "initial_command",
+    "display",
+    "lifecycle",
+    "logging",
+];
+
+/// `old` with every field this build owns replaced by `entry`'s value.
+fn merge_known_fields(old: &serde_yaml::Mapping, entry: &RawSessionConfig) -> Value {
+    let mut merged = old.clone();
+    let replacement = match entry_mapping(entry) {
+        Value::Mapping(mapping) => mapping,
+        _ => unreachable!("entry_mapping always builds a mapping"),
+    };
+    for field in ENTRY_FIELDS {
+        let field = Value::String(field.to_owned());
+        match replacement.get(&field) {
+            Some(value) => {
+                merged.insert(field, value.clone());
+            }
+            None => {
+                merged.remove(&field);
+            }
+        }
+    }
+    Value::Mapping(merged)
+}
+
 fn entries_count(document: &Value) -> usize {
     document
         .get("sessions")
@@ -304,14 +490,29 @@ fn replace(path: &Path, original: Option<String>, updated: &str) -> Result<(), S
     write_atomically(path, updated)
 }
 
-/// One entry as it would be written, at column zero.
+/// One mapping as a list item, indented into the document.
 ///
 /// The one rendering, so "what is about to be written" and "what was written"
-/// cannot drift.
-fn render_entry(entry: &RawSessionConfig) -> Result<String, SaveError> {
-    let mapping = entry_mapping(entry);
-    serde_yaml::to_string(&mapping)
-        .map_err(|error| SaveError::Unsafe(format!("the entry could not be written: {error}")))
+/// cannot drift between an append and an edit.
+fn render_mapping_item(value: &Value, indent: usize, newline: &str) -> Result<String, SaveError> {
+    let rendered = serde_yaml::to_string(value)
+        .map_err(|error| SaveError::Unsafe(format!("the entry could not be written: {error}")))?;
+    let pad = " ".repeat(indent);
+    let mut out = String::new();
+    for (index, line) in rendered.trim_end_matches('\n').lines().enumerate() {
+        if line.is_empty() {
+            out.push_str(newline);
+            continue;
+        }
+        out.push_str(&pad);
+        // `- ` starts the item; everything after it lines up under the first
+        // key, which is what makes the block read like the ones the user
+        // already has.
+        out.push_str(if index == 0 { "- " } else { "  " });
+        out.push_str(line);
+        out.push_str(newline);
+    }
+    Ok(out)
 }
 
 /// Whether `id` is already defined by the document's `sessions` list.
@@ -326,21 +527,11 @@ fn append_item(
     indent: usize,
     newline: &str,
 ) -> Result<(), SaveError> {
-    let rendered = render_entry(entry)?;
-    let pad = " ".repeat(indent);
-    for (index, line) in rendered.trim_end_matches('\n').lines().enumerate() {
-        if line.is_empty() {
-            out.push_str(newline);
-            continue;
-        }
-        out.push_str(&pad);
-        // `- ` starts the item; everything after it lines up under the first
-        // key, which is what makes the appended block read like the ones the
-        // user already has.
-        out.push_str(if index == 0 { "- " } else { "  " });
-        out.push_str(line);
-        out.push_str(newline);
-    }
+    out.push_str(&render_mapping_item(
+        &entry_mapping(entry),
+        indent,
+        newline,
+    )?);
     Ok(())
 }
 
@@ -1156,6 +1347,153 @@ mod removal_tests {
             "sessions:\n  - id: a\nother: preserve",
         ] {
             assert!(remove_session_text(text, "a").is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    /// An edited service entry. `cwd` need not exist here: the pure text edit
+    /// never validates — that is the app layer's job before it writes.
+    fn entry(id: &str, name: &str) -> RawSessionConfig {
+        RawSessionConfig {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            r#type: "service".to_owned(),
+            cwd: Some(r"D:\Tools\App".to_owned()),
+            command: Some("run app".to_owned()),
+            url: None,
+            port: None,
+            purpose: None,
+            close_impact: None,
+            shell: None,
+            initial_command: None,
+            display: None,
+            lifecycle: None,
+            logging: None,
+        }
+    }
+
+    fn sessions(document: &Value) -> &Vec<Value> {
+        document
+            .get("sessions")
+            .and_then(Value::as_sequence)
+            .expect("the document has a sessions list")
+    }
+
+    #[test]
+    fn an_edit_rewrites_only_its_own_block() {
+        let text = "\
+# 我的本地服务
+sessions:
+  # 常用
+  - id: first
+    name: First
+    type: service
+    command: old
+  - id: second
+    name: Second
+    type: service
+    command: keep me
+# 手工维护的说明
+";
+        let updated = update_session_text(text, "first", &entry("first", "First edited")).unwrap();
+
+        assert!(
+            updated.starts_with("# 我的本地服务\nsessions:\n  # 常用\n"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains(
+                "  - id: second\n    name: Second\n    type: service\n    command: keep me\n"
+            ),
+            "{updated}"
+        );
+        assert!(updated.ends_with("# 手工维护的说明\n"), "{updated}");
+        let loaded: Value = serde_yaml::from_str(&updated).expect("the edited file parses");
+        let first = &sessions(&loaded)[0];
+        let second = &sessions(&loaded)[1];
+        assert_eq!(
+            first.get("name").and_then(Value::as_str),
+            Some("First edited")
+        );
+        assert_eq!(
+            first.get("command").and_then(Value::as_str),
+            Some("run app")
+        );
+        assert_eq!(second.get("name").and_then(Value::as_str), Some("Second"));
+    }
+
+    /// A key this build does not know is not this build's to delete. A newer
+    /// version's field has to survive an edit made here.
+    #[test]
+    fn unknown_entry_fields_survive_the_rewrite() {
+        let text = "sessions:\n  - id: app\n    name: App\n    type: service\n    command: old\n    future_field: keep\n  - id: other\n    name: Other\n";
+        let updated = update_session_text(text, "app", &entry("app", "App")).unwrap();
+
+        assert!(updated.contains("future_field: keep"), "{updated}");
+        let loaded: Value = serde_yaml::from_str(&updated).unwrap();
+        assert_eq!(
+            sessions(&loaded)[0]
+                .get("future_field")
+                .and_then(Value::as_str),
+            Some("keep")
+        );
+    }
+
+    /// Comments written inside the entry survive; only the field lines the
+    /// edit owns are re-rendered.
+    #[test]
+    fn comments_inside_the_entry_survive() {
+        let text = "sessions:\n  - id: app\n    # why this command\n    command: old\n    name: App\n    type: service\n";
+        let updated = update_session_text(text, "app", &entry("app", "App")).unwrap();
+
+        assert!(updated.contains("# why this command"), "{updated}");
+        assert!(
+            updated.find("# why this command").unwrap() > updated.find("- id: app").unwrap(),
+            "the note stays inside the entry: {updated}"
+        );
+    }
+
+    /// Clearing an optional field means removing it from the file, which is
+    /// what makes a blank box in the form an edit rather than a no-op.
+    #[test]
+    fn a_cleared_field_is_removed() {
+        let text = "sessions:\n  - id: app\n    name: App\n    type: service\n    command: old\n    url: 'http://127.0.0.1:8000/'\n    purpose: old purpose\n";
+        let updated = update_session_text(text, "app", &entry("app", "App")).unwrap();
+
+        let loaded: Value = serde_yaml::from_str(&updated).unwrap();
+        assert!(sessions(&loaded)[0].get("url").is_none(), "{updated}");
+        assert!(sessions(&loaded)[0].get("purpose").is_none(), "{updated}");
+    }
+
+    #[test]
+    fn crlf_is_preserved() {
+        let text = "sessions:\r\n  - id: app\r\n    name: App\r\n    type: service\r\n    command: old\r\n";
+        let updated = update_session_text(text, "app", &entry("app", "App")).unwrap();
+
+        assert!(updated.contains("\r\n"), "the file's newlines are kept");
+        assert!(
+            !updated.replace("\r\n", "").contains('\n'),
+            "no lone LF is introduced: {updated:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_duplicate_or_inline_entry_is_refused() {
+        for text in [
+            "sessions:\n",
+            "sessions: []\n",
+            "sessions:\n  - id: app\n  - id: app\n",
+            "sessions: [{id: app}]",
+            "sessions:\n  - id: other\n",
+        ] {
+            assert!(
+                update_session_text(text, "app", &entry("app", "App")).is_err(),
+                "{text:?} must be refused"
+            );
         }
     }
 }

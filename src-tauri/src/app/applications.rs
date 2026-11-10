@@ -36,8 +36,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::config::{
-    save_session, session_ids, validate_entry, DisplayMode, LifecycleOwner, LoggingConfig,
-    RawSessionConfig,
+    save_session, session_ids, update_saved_session, validate_entry, DisplayMode, LifecycleOwner,
+    LoggingConfig, RawSessionConfig, SessionType,
 };
 use crate::session::core::{CreatedSession, SessionCore};
 
@@ -122,6 +122,96 @@ pub fn add_application(
     Ok(CreatedSession { config, runtime })
 }
 
+/// Validate, apply and persist an edit of one configured application.
+///
+/// The id is the session's, not the form's: an edit changes what the entry
+/// runs, never which session it is. Fields the form cleared are removed from
+/// the entry; keys this build does not know are left in place (see
+/// [`crate::config::update_session_text`]).
+///
+/// The registry moves first, exactly as [`add_application`] registers first:
+/// validation and the "nothing is running" check happen there, while the file
+/// is still untouched. A write that then fails puts the previous configuration
+/// back, and the answer is the file's refusal. Only after the file holds the
+/// edit is it announced (`session-saved`), because until then a listener would
+/// be showing a configuration the next start would not load.
+pub fn update_application(
+    core: &SessionCore,
+    config_file: Option<&Path>,
+    session_id: &str,
+    form: NewApplication,
+) -> Result<CreatedSession, FormError> {
+    let Some(config_file) = config_file else {
+        return Err(FormError::new(
+            None,
+            "无法确定配置文件位置；请检查系统应用数据目录后重启应用。",
+        ));
+    };
+
+    let Some(entry) = core.session_entry(session_id) else {
+        return Err(FormError::new(
+            None,
+            format!("会话 `{session_id}` 不在受管名单里，无法编辑"),
+        ));
+    };
+    if entry.temporary {
+        return Err(FormError::new(
+            None,
+            "临时终端还没有配置文件；请先用“保存启动配置”保存，再编辑它。",
+        ));
+    }
+    if entry.config.session_type != SessionType::Service {
+        return Err(FormError::new(
+            None,
+            "这里编辑的是应用配置；已保存终端的启动方式由它自己的“保存启动配置”管理。",
+        ));
+    }
+
+    let raw = raw_entry_for(&form, session_id.to_owned())?;
+    // The file has to define this entry, and its position is what a validation
+    // message counts by. Reading it here also refuses before the registry moves
+    // when the file no longer holds the session (a hand edit, a stale row).
+    let text = std::fs::read_to_string(config_file).map_err(|error| {
+        FormError::new(
+            None,
+            format!("无法读取配置文件 `{}`：{error}", config_file.display()),
+        )
+    })?;
+    let ids = session_ids(&text);
+    let matches = ids.iter().filter(|id| id.as_str() == session_id).count();
+    let position = ids.iter().position(|id| id == session_id);
+    let Some(position) = position.filter(|_| matches == 1) else {
+        return Err(FormError::new(
+            None,
+            format!(
+                "`{}` 里没有唯一的 `{session_id}` 配置项；请检查配置文件后重试",
+                config_file.display()
+            ),
+        ));
+    };
+
+    let config = validate_entry(position + 1, &raw)
+        .map_err(|error| FormError::new(error.field.as_deref(), error.message))?;
+
+    let previous = core
+        .update_config(session_id, config.clone())
+        .map_err(|error| FormError::new(None, error.message))?;
+
+    if let Err(error) = update_saved_session(config_file, session_id, &raw) {
+        let mut message = error.message(config_file);
+        if core.update_config(session_id, previous.config).is_err() {
+            message.push_str("；列表中的配置未能恢复，请重试或重启应用");
+        }
+        return Err(FormError::new(None, message));
+    }
+
+    core.publish_saved(session_id);
+    let runtime = core
+        .snapshot(session_id)
+        .ok_or_else(|| FormError::new(None, "会话状态无法读取；请重启应用后重试"))?;
+    Ok(CreatedSession { config, runtime })
+}
+
 /// What the config file and the registry already hold.
 ///
 /// The two are asked together because the one new entry has to fit both, and
@@ -155,11 +245,8 @@ fn occupancy(core: &SessionCore, config_file: &Path) -> Result<Occupancy, FormEr
     })
 }
 
-/// The entry to write, with its id minted against everything already taken.
-fn raw_entry(
-    form: &NewApplication,
-    taken: &BTreeSet<String>,
-) -> Result<RawSessionConfig, FormError> {
+/// The three required form values, trimmed, or the field's own refusal.
+fn required_fields(form: &NewApplication) -> Result<(String, String, String), FormError> {
     let required = |value: &str, field: &str, hint: &str| -> Result<String, FormError> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -182,9 +269,35 @@ fn raw_entry(
         "command",
         "set the command that starts the application, e.g. `node server.js`",
     )?;
+    Ok((name, cwd, command))
+}
 
-    Ok(RawSessionConfig {
-        id: mint_id(&name, taken),
+/// The entry to write for an addition, with its id minted against everything
+/// already taken.
+fn raw_entry(
+    form: &NewApplication,
+    taken: &BTreeSet<String>,
+) -> Result<RawSessionConfig, FormError> {
+    let (name, cwd, command) = required_fields(form)?;
+    Ok(raw_config(form, mint_id(&name, taken), name, cwd, command))
+}
+
+/// The entry to write for an edit: the same fields, under the id the session
+/// already has.
+fn raw_entry_for(form: &NewApplication, id: String) -> Result<RawSessionConfig, FormError> {
+    let (name, cwd, command) = required_fields(form)?;
+    Ok(raw_config(form, id, name, cwd, command))
+}
+
+fn raw_config(
+    form: &NewApplication,
+    id: String,
+    name: String,
+    cwd: String,
+    command: String,
+) -> RawSessionConfig {
+    RawSessionConfig {
+        id,
         name,
         r#type: "service".to_owned(),
         cwd: Some(cwd),
@@ -198,7 +311,7 @@ fn raw_entry(
         display: form.display,
         lifecycle: form.lifecycle,
         logging: form.logging.clone(),
-    })
+    }
 }
 
 /// A session id for `name` that nothing already holds.
@@ -609,6 +722,151 @@ mod tests {
         assert!(error.message.contains("1-65535"), "{}", error.message);
         assert!(core.entries().is_empty());
         assert!(!config.path().exists());
+    }
+
+    /// The whole promise of an edit: the row and the file describe the same
+    /// entry afterwards, under the id it already had.
+    #[test]
+    fn an_edit_updates_the_row_and_the_file_under_the_same_id() {
+        let config = TempConfig::with(None);
+        let core = SessionCore::without_listener();
+        let added = add_application(&core, Some(config.path()), form("ComfyUI")).unwrap();
+
+        let mut edited = form("ComfyUI Studio");
+        edited.purpose = Some("编辑后的用途".to_owned());
+        edited.port = Some(8189);
+        let updated = update_application(&core, Some(config.path()), &added.config.id, edited)
+            .expect("the edit saves");
+
+        assert_eq!(updated.config.id, "comfyui");
+        assert_eq!(updated.config.name, "ComfyUI Studio");
+        assert_eq!(
+            core.session_config("comfyui").expect("registered").name,
+            "ComfyUI Studio"
+        );
+
+        let loaded = load_from_file(config.path()).expect("the file loads");
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].id, "comfyui");
+        assert_eq!(loaded.sessions[0].name, "ComfyUI Studio");
+        assert_eq!(loaded.sessions[0].purpose.as_deref(), Some("编辑后的用途"));
+        assert_eq!(loaded.sessions[0].port, Some(8189));
+    }
+
+    /// Editing one entry leaves the rest of the user's document alone: other
+    /// entries, their comments, and keys this build does not own.
+    #[test]
+    fn an_edit_preserves_the_rest_of_the_document() {
+        let original = "\
+# 手工维护
+sessions:
+  - id: app
+    name: App
+    type: service
+    command: run
+  # second note
+  - id: second
+    name: Second
+    type: service
+    command: two
+";
+        let config = TempConfig::with(Some(original));
+        let core = SessionCore::without_listener();
+        let entry = load_from_file(config.path())
+            .expect("loads")
+            .sessions
+            .remove(0);
+        core.register(entry).expect("registers");
+
+        let mut edited = form("App");
+        edited.name = "App Edited".to_owned();
+        update_application(&core, Some(config.path()), "app", edited).expect("the edit saves");
+
+        let text = config.read();
+        assert!(text.starts_with("# 手工维护\n"), "{text}");
+        assert!(text.contains("# second note"), "{text}");
+        assert!(
+            text.contains("  - id: second\n    name: Second\n"),
+            "{text}"
+        );
+        let loaded = load_from_file(config.path()).expect("the file loads");
+        let ids: Vec<&str> = loaded.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["app", "second"]);
+        assert_eq!(loaded.sessions[0].name, "App Edited");
+    }
+
+    /// A refused validation writes nothing and changes nothing; the form gets
+    /// the field the config layer named.
+    #[test]
+    fn a_refused_edit_leaves_the_row_and_the_file_unchanged() {
+        let config = TempConfig::with(None);
+        let core = SessionCore::without_listener();
+        let added = add_application(&core, Some(config.path()), form("App")).unwrap();
+        let before = config.read();
+
+        let mut edited = form("App");
+        edited.port = Some(0);
+        let error = update_application(&core, Some(config.path()), &added.config.id, edited)
+            .expect_err("port 0 is not usable");
+
+        assert_eq!(error.field.as_deref(), Some("port"));
+        assert_eq!(config.read(), before);
+        assert_eq!(
+            core.session_config("app").expect("registered").name,
+            "App",
+            "the row keeps the configuration it had"
+        );
+    }
+
+    /// A live run was started from the configuration being edited; the edit is
+    /// refused until the run is settled.
+    #[cfg(windows)]
+    #[test]
+    fn editing_a_live_application_is_refused() {
+        let config = TempConfig::with(None);
+        let core = SessionCore::without_listener();
+        let mut application = form("App");
+        application.command = "cmd.exe /c ping -n 120 127.0.0.1".to_owned();
+        let added = add_application(&core, Some(config.path()), application).unwrap();
+        core.start(&added.config.id).expect("start succeeds");
+        let before = config.read();
+
+        let error = update_application(
+            &core,
+            Some(config.path()),
+            &added.config.id,
+            form("App Edited"),
+        )
+        .expect_err("a live run cannot be edited");
+
+        assert!(error.message.contains("stop"), "{}", error.message);
+        assert_eq!(config.read(), before);
+        assert_eq!(core.session_config("app").expect("registered").name, "App");
+        core.force_stop("app").expect("cleanup");
+    }
+
+    /// A row the file no longer holds (a hand edit took it out) is refused
+    /// before anything is written: the file is the source of the entry.
+    #[test]
+    fn editing_an_entry_the_file_no_longer_holds_is_refused() {
+        let config = TempConfig::with(None);
+        let core = SessionCore::without_listener();
+        let added = add_application(&core, Some(config.path()), form("App")).unwrap();
+        let other =
+            "sessions:\n  - id: other\n    name: Other\n    type: service\n    command: run\n";
+        fs::write(config.path(), other).unwrap();
+
+        let error = update_application(
+            &core,
+            Some(config.path()),
+            &added.config.id,
+            form("App Edited"),
+        )
+        .expect_err("the file does not define this id");
+
+        assert!(error.message.contains("app"), "{}", error.message);
+        assert_eq!(config.read(), other);
+        assert_eq!(core.session_config("app").expect("registered").name, "App");
     }
 
     /// The slug rules, stated where they are decided.

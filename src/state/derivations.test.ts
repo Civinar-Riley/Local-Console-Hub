@@ -319,6 +319,25 @@ describe("availableActions", () => {
     expect(availableActions(managed, runtime({ status: "stopped" })).start).toBe(true);
   });
 
+  // Editing is a configured service's action, offered while it is settled: a
+  // live run was started from the configuration being edited, and a temporary
+  // terminal has no file entry (its "保存启动配置" writes one).
+  it("offers editing to a settled configured service, and nobody else", () => {
+    expect(availableActions(config(), runtime({ status: "stopped" })).edit).toBe(true);
+    expect(availableActions(config(), runtime({ status: "exited" })).edit).toBe(true);
+    // A failed start left nothing running; the configuration is still the
+    // user's to fix.
+    expect(availableActions(config(), runtime({ status: "error" })).edit).toBe(true);
+    expect(availableActions(config(), runtime()).edit).toBe(false);
+    expect(availableActions(config(), runtime({ status: "starting" })).edit).toBe(false);
+    expect(availableActions(config(), runtime({ status: "stopping" })).edit).toBe(false);
+    expect(availableActions(config({ temporary: true }), runtime({ status: "stopped" })).edit).toBe(
+      false,
+    );
+    const terminal = config({ sessionType: "terminal", shell: "pwsh" });
+    expect(availableActions(terminal, runtime({ status: "stopped" })).edit).toBe(false);
+  });
+
   // Saving a terminal's launch configuration (#65) is the one control that is
   // offered *while the terminal runs*: it is the terminal in front of the user
   // that is worth keeping, and ending it first would throw away the thing being

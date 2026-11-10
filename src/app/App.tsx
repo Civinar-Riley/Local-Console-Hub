@@ -120,6 +120,8 @@ export default function App() {
   const [focusRequest, setFocusRequest] = useState(0);
   /** Whether the "添加应用" form is open (#64). */
   const [addApplicationOpen, setAddApplicationOpen] = useState(false);
+  /** The configured application whose launch configuration is being edited. */
+  const [editApplicationTarget, setEditApplicationTarget] = useState<SessionConfigDto | null>(null);
   /** The terminal whose launch configuration is being saved (#65). */
   const [removeApplicationTarget, setRemoveApplicationTarget] = useState<SessionConfigDto | null>(
     null,
@@ -342,6 +344,34 @@ export default function App() {
   };
 
   /**
+   * "编辑应用": the same form, opened on the selected entry's saved values.
+   *
+   * The target is captured rather than read from the selection on submit — the
+   * workspace can move under an open dialog, and saving whichever session
+   * happened to be selected afterwards would edit the wrong entry.
+   */
+  const onOpenEditApplication = (sessionId: string) => {
+    if (!registry.live) {
+      onPreviewAction(SESSION_ACTION_LABELS["edit-application"]);
+      return;
+    }
+    const target = sessions.find((session) => session.config.id === sessionId);
+    if (target !== undefined) setEditApplicationTarget(target.config);
+  };
+
+  const onUpdateApplication = async (form: NewApplicationFormDto) => {
+    if (editApplicationTarget === null) {
+      return { ok: false as const, message: "没有正在编辑的应用" };
+    }
+    const result = await registry.updateApplication(editApplicationTarget.id, form);
+    if (result.ok) {
+      setEditApplicationTarget(null);
+      setNotice(`已保存「${form.name}」的修改`);
+    }
+    return result;
+  };
+
+  /**
    * "保存启动配置" (#65): a name, then a saved launch configuration.
    *
    * The launch method is not on the form — it is what the terminal is already
@@ -533,6 +563,9 @@ export default function App() {
       case "save-config":
         onOpenSaveTerminal();
         break;
+      case "edit-application":
+        onOpenEditApplication(selected.config.id);
+        break;
       case "remove-application":
         setRemoveApplicationTarget(selected.config);
         break;
@@ -554,6 +587,25 @@ export default function App() {
       onClose={() => setAddApplicationOpen(false)}
     />
   ) : null;
+
+  /**
+   * The same form, opened on the application being edited.
+   *
+   * Keyed by the target: a different entry is a different form, and mounting
+   * it fresh is what keeps one entry's values out of another's inputs.
+   */
+  const editApplicationDialog =
+    editApplicationTarget === null ? null : (
+      <AddApplicationDialog
+        key={editApplicationTarget.id}
+        initial={editApplicationTarget}
+        onSubmit={onUpdateApplication}
+        onRecommendDisplay={recommendDisplay}
+        onPickPath={discovery.pick}
+        onScanDirectory={discovery.scan}
+        onClose={() => setEditApplicationTarget(null)}
+      />
+    );
 
   /**
    * The save form (#65), holding the terminal it was opened for.
@@ -794,6 +846,7 @@ export default function App() {
       </div>
       <StatusBar counts={counts} connection={connection} notice={statusNotice} />
       {addApplicationDialog}
+      {editApplicationDialog}
       {saveTerminalDialog}
       {removeApplicationDialog}
       {openChoiceDialog}

@@ -19,6 +19,7 @@ export type SessionAction =
   | "copy-path"
   | "new-session"
   | "save-config"
+  | "edit-application"
   | "remove-session"
   | "remove-application";
 
@@ -38,6 +39,9 @@ export const SESSION_ACTION_LABELS: Record<SessionAction, string> = {
   // Saving a temporary terminal's launch method (#65): the other half of the
   // quick entry — this one keeps the shell and directory for next time.
   "save-config": "保存启动配置",
+  // Editing a configured application's launch method: the same form that added
+  // it, opened on what the file already holds.
+  "edit-application": "编辑应用",
   "remove-session": "关闭临时终端",
   "remove-application": "从受管名单移除",
 };

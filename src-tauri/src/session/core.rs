@@ -2487,6 +2487,84 @@ impl SessionCore {
         })
     }
 
+    /// Replace a configured session's launch configuration.
+    ///
+    /// This is the registry half of "编辑应用"; the file half is
+    /// [`crate::config::update_saved_session`], and the caller writes it after
+    /// this returns. The id is not editable — it keys the registry, the file
+    /// and the session's log directory — so a configuration naming another id
+    /// is refused rather than applied under the wrong row.
+    ///
+    /// Refused for a session the window made (it has no file entry) and for
+    /// one that is not settled: a run was started from a configuration, and
+    /// changing that configuration under it would make the snapshot describe a
+    /// run it did not start. Stopped, exited, and failed-to-start sessions have
+    /// nothing in flight, which is the state an edit is for.
+    pub(crate) fn update_config(
+        &self,
+        session_id: &str,
+        config: SessionConfig,
+    ) -> Result<SessionEntry, SessionError> {
+        const OPERATION: &str = "update_application";
+
+        let handle = self
+            .handle(session_id)
+            .ok_or_else(|| SessionError::unknown_session(session_id, OPERATION))?;
+
+        let mut state = lock(&handle);
+        if state.temporary {
+            return Err(SessionError::failed(
+                session_id,
+                OPERATION,
+                format!(
+                    "session `{session_id}` is not in the config file; save its launch \
+                     configuration before editing it"
+                ),
+                None,
+            ));
+        }
+        if config.id != session_id {
+            return Err(SessionError::failed(
+                session_id,
+                OPERATION,
+                format!(
+                    "the edited configuration names `{}` rather than `{session_id}`; an edit has \
+                     to describe the session it was made for",
+                    config.id
+                ),
+                None,
+            ));
+        }
+        let status = state.runtime.status;
+        if state.adopted.is_some()
+            || matches!(
+                status,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping
+            )
+            || state.run.as_ref().is_some_and(Run::holds_live_process)
+        {
+            return Err(SessionError::failed(
+                session_id,
+                OPERATION,
+                format!(
+                    "session `{session_id}` is {}; stop it before editing its configuration",
+                    status.as_str()
+                ),
+                Some(status),
+            ));
+        }
+
+        state.config = config.clone();
+        // The snapshot carries the effective logging so the rail and the Logs
+        // tab can answer "is this being recorded?" without a config read. It
+        // describes the configuration, so it changes with it.
+        state.runtime.logging = config.logging.clone();
+        Ok(SessionEntry {
+            config,
+            temporary: false,
+        })
+    }
+
     /// Remove a temporary session from the registry (#62).
     ///
     /// Refused for a configured session — that one belongs to the config file,
@@ -5054,6 +5132,73 @@ mod tests {
         assert!(error.message.contains("stop"), "message: {error}");
 
         core.force_stop("svc").expect("cleanup");
+    }
+
+    /// Editing a settled session replaces the configuration the registry holds
+    /// and the effective logging the snapshot reports.
+    #[test]
+    fn a_settled_configured_session_can_be_edited() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let mut edited = core.session_config("svc").expect("registered");
+        edited.name = "Renamed".to_owned();
+        edited.purpose = Some("new purpose".to_owned());
+        edited.logging = EffectiveLogging {
+            mode: EffectiveLogMode::Off,
+            source: LogSource::None,
+            external_path: None,
+        };
+
+        let entry = core
+            .update_config("svc", edited.clone())
+            .expect("the edit applies");
+
+        assert_eq!(entry.config.name, "Renamed");
+        assert_eq!(entry.config.purpose.as_deref(), Some("new purpose"));
+        assert!(!entry.temporary);
+        let runtime = core.snapshot("svc").expect("registered");
+        assert_eq!(runtime.status, SessionStatus::Stopped);
+        assert_eq!(runtime.logging, edited.logging);
+    }
+
+    /// A run was started from a configuration; editing it under the run would
+    /// leave the snapshot describing something that never ran.
+    #[test]
+    fn editing_a_session_with_a_live_run_is_refused() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        core.start("svc").expect("start succeeds");
+        let mut edited = core.session_config("svc").expect("registered");
+        edited.name = "Renamed".to_owned();
+
+        let error = core
+            .update_config("svc", edited)
+            .expect_err("refused while running");
+        assert!(error.message.contains("stop"), "{}", error.message);
+
+        core.force_stop("svc").expect("cleanup");
+    }
+
+    #[test]
+    fn editing_a_temporary_session_is_refused() {
+        let core = SessionCore::without_listener();
+        let mut config = service("temp");
+        core.register_temporary(&mut config).expect("registered");
+
+        let error = core
+            .update_config("temp", config)
+            .expect_err("a temporary session has no file entry");
+        assert!(error.message.contains("config file"), "{}", error.message);
+    }
+
+    #[test]
+    fn editing_under_another_id_is_refused() {
+        let (core, _sink) = core_with_command("svc", LONG_RUNNING);
+        let mut elsewhere = core.session_config("svc").expect("registered");
+        elsewhere.id = "someone-else".to_owned();
+
+        let error = core
+            .update_config("svc", elsewhere)
+            .expect_err("an edit cannot move the id");
+        assert!(error.message.contains("someone-else"), "{}", error.message);
     }
 
     /// Poll until the session reaches `want`, so a test asserts on the state

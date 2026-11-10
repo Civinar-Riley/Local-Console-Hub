@@ -2,6 +2,7 @@ import {
   AppWindow,
   ExternalLink,
   FolderOpen,
+  Pencil,
   Trash2,
   X,
   Play,
@@ -136,6 +137,18 @@ export default function SessionHeader({
             >
               <FolderOpen size={14} />
               目录
+            </button>
+          )}
+          {actions.edit && (
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              disabled={closing}
+              title="编辑这个应用的启动配置"
+              onClick={() => onAction("edit-application")}
+            >
+              <Pencil size={14} />
+              编辑
             </button>
           )}
           <button

@@ -117,6 +117,14 @@ export interface SessionRegistry {
    */
   addApplication(form: NewApplicationFormDto): Promise<FormSaveOutcome>;
   /**
+   * Edit a configured application's launch configuration.
+   *
+   * The id is the row being edited; the form carries the fields, never a new
+   * id. Answers once the backend has validated, applied and written the edit,
+   * or with the refusal that belongs to the form.
+   */
+  updateApplication(sessionId: string, form: NewApplicationFormDto): Promise<FormSaveOutcome>;
+  /**
    * Save a temporary terminal's launch configuration (#65) — "保存启动配置".
    *
    * Answers once the backend has written the entry *and* marked the session
@@ -314,6 +322,33 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
   );
 
   /**
+   * Edit a configured application's launch configuration.
+   *
+   * The answer is the same pair an addition answers with, so `adopt` corrects
+   * the row in place: an edit changes what the row *is*, never which row it
+   * is. A refusal comes back as the form's field so the dialog can keep it
+   * beside the input that caused it.
+   */
+  const updateApplication = useCallback(
+    async (sessionId: string, form: NewApplicationFormDto): Promise<FormSaveOutcome> => {
+      try {
+        const raw = await invoke<unknown>("update_application", { sessionId, form });
+        if (!isCreatedSessionDto(raw)) {
+          throw new Error("update_application 返回了无法识别的载荷");
+        }
+        controller.current?.adopt(raw);
+        return { ok: true, sessionId: raw.config.id };
+      } catch (cause) {
+        if (isFormErrorDto(cause)) {
+          return { ok: false, message: cause.message, field: cause.field };
+        }
+        return { ok: false, message: sessionErrorMessage(cause) };
+      }
+    },
+    [],
+  );
+
+  /**
    * "保存启动配置" (#65).
    *
    * The answer is the same pair a creation answers with, and `adopt` applies it
@@ -473,6 +508,7 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
       openDirectory: (sessionId) => run("open_session_cwd", sessionId),
       createTerminal,
       addApplication,
+      updateApplication,
       saveTerminal,
       closeTerminal,
       closingSessionIds,
@@ -493,6 +529,7 @@ export function useSessionRegistry(connection: BackendConnection): SessionRegist
       resolveOpen,
       createTerminal,
       addApplication,
+      updateApplication,
       saveTerminal,
       closeTerminal,
       closingSessionIds,

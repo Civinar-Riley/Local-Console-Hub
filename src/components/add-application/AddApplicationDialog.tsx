@@ -10,9 +10,11 @@ import {
 import type {
   DisplayAdviceDto,
   DisplayModeValue,
+  EffectiveLoggingDto,
   FormErrorDto,
   FormSaveOutcome,
   NewApplicationFormDto,
+  SessionConfigDto,
 } from "../../types/config";
 import "../dialog/dialog.css";
 
@@ -44,6 +46,14 @@ export interface AddApplicationDialogProps {
   onRecommendDisplay?: (command: string, cwd: string) => Promise<DisplayAdviceDto | null>;
   onPickPath?: (kind: PathKind, cwd: string) => Promise<string | null>;
   onScanDirectory?: (cwd: string) => Promise<DirectoryScan>;
+  /**
+   * The application being edited, or absent when this form adds one.
+   *
+   * One component for both entries: an edit is this form opened on what the
+   * file already holds, so the two cannot validate, recommend a display mode,
+   * or write the same fields differently.
+   */
+  initial?: SessionConfigDto;
   onClose: () => void;
 }
 
@@ -199,6 +209,37 @@ export function legalPolicyFor(mode: DisplayModeValue, policy: string): string {
 }
 
 /**
+ * A stored URL split back into the form's two inputs.
+ *
+ * The form keeps the protocol in a select and the address in a text box, while
+ * the config layer stores the normalized URL. An entry without a URL opens on
+ * `http://` and an empty address, which is the same state a fresh add starts
+ * in.
+ */
+export function urlParts(url: string | undefined): { protocol: string; address: string } {
+  const value = url?.trim() ?? "";
+  const match = value.match(/^(https?:\/\/)(.*)$/i);
+  return match
+    ? { protocol: match[1].toLowerCase(), address: match[2] }
+    : { protocol: "http://", address: value };
+}
+
+/**
+ * The policy select's value for an entry's effective logging.
+ *
+ * The block on the snapshot is *effective* — `auto` is already resolved — so
+ * every value maps back to the one policy that produces it. `external` wins
+ * over `mode`, because the form's external option is the one that carries a
+ * path and is the only way an entry can have one.
+ */
+export function policyForLogging(logging: EffectiveLoggingDto): string {
+  if (logging.source === "external") return "external";
+  if (logging.mode === "off") return "off";
+  if (logging.mode === "manual") return "manual";
+  return logging.mode === "always" ? "always" : "on_error";
+}
+
+/**
  * The "添加应用" form (#64, spec #59 decision 7).
  *
  * The secondary entry, deliberately apart from "新建 PowerShell": that one
@@ -215,26 +256,45 @@ export function legalPolicyFor(mode: DisplayModeValue, policy: string): string {
  * window — whether the Hub ends it along with everything else. The display
  * choice starts on what the Hub could *confirm* about the launch method
  * (spec #59 decision 9), and stays wherever the user puts it.
+ *
+ * ## Adding and editing are the same form
+ *
+ * `initial` turns the entry into an edit: the same fields open on what the
+ * config file holds, and the answer carries the edit back to the backend under
+ * the id the session already has. The saved display choice and the fields
+ * already filled count as the user's decisions, so the discovery scan and the
+ * display recommendation do not overwrite them — the user can still replace a
+ * value explicitly.
  */
 export default function AddApplicationDialog({
   onSubmit,
   onRecommendDisplay,
   onPickPath,
   onScanDirectory,
+  initial,
   onClose,
 }: AddApplicationDialogProps) {
-  const [name, setName] = useState("");
-  const [cwd, setCwd] = useState("");
-  const [command, setCommand] = useState("");
-  const [purpose, setPurpose] = useState("");
-  const [closeImpact, setCloseImpact] = useState("");
-  const [port, setPort] = useState("");
-  const [url, setUrl] = useState("");
-  const [protocol, setProtocol] = useState("http://");
+  const editing = initial !== undefined;
+  const initialUrl = urlParts(initial?.url);
+  const [name, setName] = useState(initial?.name ?? "");
+  const [cwd, setCwd] = useState(initial?.cwd ?? "");
+  const [command, setCommand] = useState(initial?.command ?? "");
+  const [purpose, setPurpose] = useState(initial?.purpose ?? "");
+  const [closeImpact, setCloseImpact] = useState(initial?.closeImpact ?? "");
+  const [port, setPort] = useState(initial?.port === undefined ? "" : String(initial.port));
+  const [url, setUrl] = useState(initialUrl.address);
+  const [protocol, setProtocol] = useState(initialUrl.protocol);
   const [scan, setScan] = useState<DirectoryScan | null>(null);
   const [picking, setPicking] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
-  const dirty = useRef(new Set<string>());
+  /**
+   * Fields the user (or the file being edited) has already decided.
+   *
+   * Discovery may fill a field it has not been told about, never one that is
+   * already set: an edit opens on the saved values, and scanning the directory
+   * again must not replace them with a guess.
+   */
+  const dirty = useRef(new Set<string>(editing ? ["name", "command", "port", "url", "log"] : []));
   const request = useRef(0);
   useEffect(
     () => () => {
@@ -242,12 +302,23 @@ export default function AddApplicationDialog({
     },
     [],
   );
-  const [policy, setPolicy] = useState(LOG_POLICIES[0].value);
-  const [logPath, setLogPath] = useState("");
-  const [display, setDisplay] = useState<DisplayModeValue>("internal");
-  /** Whether the user has chosen a mode, which is what makes it theirs. */
-  const [displayTouched, setDisplayTouched] = useState(false);
-  const [manageLifecycle, setManageLifecycle] = useState(false);
+  const [policy, setPolicy] = useState(
+    initial === undefined ? LOG_POLICIES[0].value : policyForLogging(initial.logging),
+  );
+  const [logPath, setLogPath] = useState(
+    initial?.logging.source === "external" ? (initial.logging.externalPath ?? "") : "",
+  );
+  const [display, setDisplay] = useState<DisplayModeValue>(initial?.display ?? "internal");
+  /**
+   * Whether the user has chosen a mode, which is what makes it theirs.
+   *
+   * An edited entry's mode came from the file, so it is the user's already: the
+   * recommendation shows its reason but does not move a saved choice.
+   */
+  const [displayTouched, setDisplayTouched] = useState(editing);
+  const [manageLifecycle, setManageLifecycle] = useState(
+    initial?.display === "window" && initial.lifecycle === "managed",
+  );
   const [advice, setAdvice] = useState<DisplayAdviceDto | null>(null);
   /**
    * The command the current advice is about.
@@ -452,7 +523,7 @@ export default function AddApplicationDialog({
       >
         <header className="dialog__head">
           <h2 className="dialog__title" id="add-application-title">
-            添加应用
+            {editing ? "编辑应用" : "添加应用"}
           </h2>
           <button
             type="button"
@@ -466,7 +537,9 @@ export default function AddApplicationDialog({
         </header>
 
         <p className="dialog__lead">
-          保存一个启动配置；保存后会立即出现在会话列表里，下次打开 Hub 仍然可用。
+          {editing
+            ? "修改会写回配置文件，并立即更新会话列表；正在运行的应用需先停止。"
+            : "保存一个启动配置；保存后会立即出现在会话列表里，下次打开 Hub 仍然可用。"}
         </p>
 
         <div className="dialog__body">
@@ -784,7 +857,7 @@ export default function AddApplicationDialog({
             className="btn btn--primary btn--sm"
             disabled={submitting || picking}
           >
-            {submitting ? "正在保存…" : "保存应用"}
+            {submitting ? "正在保存…" : editing ? "保存修改" : "保存应用"}
           </button>
         </footer>
       </form>

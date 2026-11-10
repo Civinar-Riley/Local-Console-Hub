@@ -19,7 +19,10 @@ use tauri::State;
 // Aliased so the commands below can keep the plain names the window calls:
 // `add_application` and `save_terminal_config` are each a Tauri command *and*
 // an app-layer operation, and the two are the same thing one call apart.
-use crate::app::applications::{add_application as register_application, NewApplication};
+use crate::app::applications::{
+    add_application as register_application, update_application as update_saved_application,
+    NewApplication,
+};
 use crate::app::form::FormError;
 use crate::app::terminals::{save_terminal_config as save_terminal, SaveTerminal};
 use crate::config::{ConfigReportDto, SessionConfigDto};
@@ -142,6 +145,28 @@ pub fn add_application(
 ) -> Result<CreatedSessionDto, FormError> {
     let config_file = report.config_path.as_deref().map(std::path::Path::new);
     register_application(&core, config_file, form).map(CreatedSessionDto::configured)
+}
+
+/// Edit a configured application's launch configuration.
+///
+/// The id is the session being edited, never one the form can change: an edit
+/// changes what the entry runs, and the id keys the registry, the config file
+/// and the session's log directory. The answer is the same pair an addition
+/// answers with, so the window can re-render the row from the write that just
+/// landed.
+///
+/// The file to write comes from the startup report for the same reason
+/// [`add_application`] does.
+#[tauri::command(async)]
+pub fn update_application(
+    core: State<'_, SessionCore>,
+    report: State<'_, ConfigReportDto>,
+    session_id: String,
+    form: NewApplication,
+) -> Result<CreatedSessionDto, FormError> {
+    let config_file = report.config_path.as_deref().map(std::path::Path::new);
+    update_saved_application(&core, config_file, &session_id, form)
+        .map(CreatedSessionDto::configured)
 }
 
 /// What the Hub can confirm about a launch method's display mode (#66).

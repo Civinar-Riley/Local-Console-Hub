@@ -1,12 +1,15 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import type { SessionConfigDto } from "../../types/config";
 import AddApplicationDialog, {
   displayHint,
   errorPlacement,
   legalPolicyFor,
   logPoliciesFor,
   loggingFor,
+  policyForLogging,
+  urlParts,
 } from "./AddApplicationDialog";
 
 function render(): string {
@@ -222,5 +225,100 @@ describe("loggingFor", () => {
       if (logging === undefined) continue;
       expect(logging.source === "captured" && logging.mode === "off").toBe(false);
     }
+  });
+});
+
+function saved(overrides: Partial<SessionConfigDto> = {}): SessionConfigDto {
+  return {
+    id: "comfyui",
+    name: "ComfyUI",
+    sessionType: "service",
+    cwd: "D:/Tools/ComfyUI",
+    command: "python main.py",
+    url: "http://127.0.0.1:8188",
+    port: 8188,
+    purpose: "图像生成后端",
+    closeImpact: "停止会中断当前生成",
+    display: "window",
+    lifecycle: "managed",
+    logging: {
+      mode: "always",
+      source: "external",
+      externalPath: "D:/Tools/ComfyUI/app.log",
+    },
+    ...overrides,
+  };
+}
+
+function renderEdit(initial: SessionConfigDto): string {
+  return renderToStaticMarkup(
+    createElement(AddApplicationDialog, { initial, onSubmit: vi.fn(), onClose: vi.fn() }),
+  );
+}
+
+describe("edit mode", () => {
+  /// The same form, opened on what the file holds: every stored field is in
+  /// the input that owns it, so an edit starts from the saved configuration
+  /// rather than from blank boxes.
+  it("opens prefilled from the saved configuration", () => {
+    const markup = renderEdit(saved());
+
+    expect(markup).toContain("编辑应用");
+    expect(markup).toContain("保存修改");
+    expect(markup).toContain("写回配置文件");
+    for (const value of [
+      "ComfyUI",
+      "D:/Tools/ComfyUI",
+      "python main.py",
+      "图像生成后端",
+      "停止会中断当前生成",
+      "8188",
+      "127.0.0.1:8188",
+    ]) {
+      expect(markup).toContain(`value="${value}"`);
+    }
+    // The external policy is the one that owns a path, and the saved path is
+    // on screen with it.
+    expect(markup).toContain("应用日志文件");
+    expect(markup).toContain('value="D:/Tools/ComfyUI/app.log"');
+  });
+
+  /// The saved display choice belongs to the user: the form shows it as the
+  /// active one, and the recommendation does not get to move it (that is what
+  /// `displayTouched` starting true means).
+  it("keeps the saved display and lifecycle choice", () => {
+    const markup = renderEdit(saved());
+
+    expect(markup).toMatch(/aria-checked="true"[^>]*>[^<]*独立窗口/);
+    expect(markup).toMatch(/type="checkbox"[^>]*checked/);
+  });
+
+  /// The protocol is a separate select in the form, so it has to be split back
+  /// out of the stored URL rather than shown as part of the address.
+  it("splits a stored URL into protocol and address", () => {
+    expect(urlParts("https://example.com/page")).toEqual({
+      protocol: "https://",
+      address: "example.com/page",
+    });
+    expect(urlParts("http://127.0.0.1:8188")).toEqual({
+      protocol: "http://",
+      address: "127.0.0.1:8188",
+    });
+    expect(urlParts(undefined)).toEqual({ protocol: "http://", address: "" });
+    expect(urlParts("127.0.0.1:8188")).toEqual({
+      protocol: "http://",
+      address: "127.0.0.1:8188",
+    });
+  });
+
+  it("maps an effective logging block back to the policy that produces it", () => {
+    expect(policyForLogging({ mode: "off", source: "none" })).toBe("off");
+    expect(policyForLogging({ mode: "on_error", source: "captured" })).toBe("on_error");
+    expect(policyForLogging({ mode: "always", source: "captured" })).toBe("always");
+    expect(policyForLogging({ mode: "manual", source: "captured" })).toBe("manual");
+    // The path-bearing policy wins over the mode it stores.
+    expect(
+      policyForLogging({ mode: "always", source: "external", externalPath: "D:/app.log" }),
+    ).toBe("external");
   });
 });

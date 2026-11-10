@@ -24,7 +24,10 @@ pub use paths::{
     is_filesystem_safe_component, local_utc_offset_secs, run_file_name, run_log_filename,
     run_log_path, run_metadata_path, session_log_dir, AppPaths,
 };
-pub use save::{append_session, remove_saved_session, save_session, session_ids, SaveError};
+pub use save::{
+    append_session, remove_saved_session, save_session, session_ids, update_saved_session,
+    SaveError,
+};
 // Crate-visible, and only under `cargo test`: the release guards in
 // `crate::release` compare the bundle's product name against this. The
 // app-data layout is documented for users to read; the constant itself does

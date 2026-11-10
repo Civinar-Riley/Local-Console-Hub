@@ -37,6 +37,7 @@ beforeEach(() => {
     openDirectory: vi.fn(),
     createTerminal: vi.fn(),
     addApplication: vi.fn(),
+    updateApplication: vi.fn(),
     saveTerminal: vi.fn(),
     closeTerminal: vi.fn(),
     closingSessionIds: new Set(),

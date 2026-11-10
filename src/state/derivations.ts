@@ -252,6 +252,20 @@ export interface ActionAvailability {
    */
   saveConfig: boolean;
   /**
+   * Edit this application's saved launch configuration.
+   *
+   * Configured service entries only. A temporary terminal has no file entry —
+   * its "保存启动配置" is what writes one — and a session with a live run was
+   * started from the configuration being edited, so Session Core refuses both;
+   * the control is absent rather than offered-and-refused.
+   *
+   * `error` stays editable: a failed start left a configuration with nothing
+   * running. A failed stop that still owns its tree is the one case where the
+   * backend refuses an edit the header offered, because the run's liveness is
+   * not something this snapshot reports.
+   */
+  edit: boolean;
+  /**
    * Remove this session from the list (#62).
    *
    * A temporary terminal's own action, offered once its run has ended: that is
@@ -305,6 +319,7 @@ export function availableActions(
     copyPath: hasDirectory,
     forceStop: owned && isLive(runtime.status),
     saveConfig: config.temporary === true,
+    edit: config.temporary !== true && config.sessionType === "service" && idle,
     remove:
       config.temporary === true && (runtime.status === "stopped" || runtime.status === "exited"),
   };
