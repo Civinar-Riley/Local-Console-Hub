@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (must match the app version, e.g. v0.3.0)"
+        required: true
+        default: "v0.3.0"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-release:
+    name: Build and publish the Windows installers
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Resolve and check the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          test "$RELEASE_TAG" = "v$VERSION" || {
+            echo "::error::tag $RELEASE_TAG does not match the app version v$VERSION"
+            exit 1
+          }
+          test -f "docs/RELEASE_NOTES_v$VERSION.md" || {
+            echo "::error::missing docs/RELEASE_NOTES_v$VERSION.md"
+            exit 1
+          }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend typecheck and tests
+        run: |
+          npm run check
+          npm test
+
+      - name: Build the installers
+        run: npm run tauri build
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $files = @(
+            Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe"
+            Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi"
+          )
+          if ($files.Count -eq 0) { throw "no installer was produced" }
+          $lines = foreach ($file in $files) {
+            "$((Get-FileHash $file -Algorithm SHA256).Hash.ToLower())  $($file.Name)"
+          }
+          $lines | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload the build as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            SHA256SUMS.txt
+
+      - name: Publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="docs/RELEASE_NOTES_v${VERSION}.md"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes-file "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+              --title "Local Console Hub $RELEASE_TAG" --notes-file "$NOTES"
+          fi
+          gh release upload "$RELEASE_TAG" \
+            src-tauri/target/release/bundle/nsis/*-setup.exe \
+            src-tauri/target/release/bundle/msi/*.msi \
+            SHA256SUMS.txt --clobber
