@@ -65,7 +65,7 @@ describe("OpenChoiceDialog", () => {
 
   it("lists an instance it could not inspect without offering to associate it", () => {
     const markup = render({
-      reason: "另有 1 个同名进程，Hub 没有权限确认它们是不是同一个程序。",
+      reason: "另有 1 个同名进程，Hub 无法确认它们是不是同一个程序。",
       candidates: [
         candidate({
           associable: false,

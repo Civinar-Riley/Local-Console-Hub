@@ -1494,10 +1494,13 @@ impl SessionCore {
                 Err(message) => {
                     state.runtime.status = SessionStatus::Error;
                     state.runtime.pid = None;
-                    // A start that never got a run has no start time. Leaving
-                    // the previous run's here would make `Error` show an
-                    // uptime for a run that does not exist.
+                    // A start that never got a run has no start time and no
+                    // exit code. Leaving the previous run's here would make
+                    // `Error` show an uptime and a last exit for a run that
+                    // does not exist — the record that carried both was just
+                    // dropped below.
                     state.runtime.started_at = None;
+                    state.runtime.exit_code = None;
                     state.runtime.run_id = None;
                     state.runtime.pty_attached = false;
                     state.runtime.health = None;
@@ -3588,13 +3591,21 @@ impl SessionState {
     /// Record a health reading taken for the run `generation` names.
     ///
     /// `true` when the snapshot changed and the reading is worth announcing.
-    /// Two things answer `false`, and both are about the reading no longer
-    /// being news: the session has moved past that run — a restart replaced it,
-    /// or a stop has already cleared the reading — so writing it would report
-    /// the old process's health as the new run's; or it is the reading already
-    /// on the snapshot, which nothing needs republishing for.
+    /// Three things answer `false`, and all are about the reading no longer
+    /// being news: the session has moved past that run — a restart replaced it
+    /// (`generation` moved), or the run has ended and a stop or a natural exit
+    /// has already cleared the reading, so writing it would report the old
+    /// process's health as this session's; the run is no longer in flight at
+    /// all (`health` is a fact about one, per `runtime.rs` §4); or it is the
+    /// reading already on the snapshot, which nothing needs republishing for.
     fn record_health(&mut self, generation: u64, reading: health::ServiceHealth) -> bool {
-        if self.generation != generation || self.runtime.health == Some(reading) {
+        if self.generation != generation
+            || !matches!(
+                self.runtime.status,
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Stopping
+            )
+            || self.runtime.health == Some(reading)
+        {
             return false;
         }
         self.runtime.health = Some(reading);
@@ -5043,8 +5054,8 @@ mod tests {
         assert_eq!(core.summary().error, 1);
     }
 
-    /// A failed start has no start time, so the previous run's must not linger
-    /// on the snapshot (#127).
+    /// A failed start has no start time and no exit code of its own, so the
+    /// previous run's must not linger on the snapshot (#127).
     #[test]
     fn a_start_that_fails_does_not_keep_the_previous_runs_start_time() {
         let (core, _sink) = core_with_command("svc", LONG_RUNNING);
@@ -5065,6 +5076,10 @@ mod tests {
         assert_eq!(
             runtime.started_at, None,
             "a start that never got a run has no start time"
+        );
+        assert_eq!(
+            runtime.exit_code, None,
+            "the run the exit code belonged to was just dropped from the session"
         );
     }
 

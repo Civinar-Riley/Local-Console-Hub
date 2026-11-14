@@ -245,7 +245,10 @@ fn scan(logs_dir: &Path, session_id: Option<&str>, protected: &[PathBuf]) -> Vec
     let mut files = Vec::new();
 
     for found in super::layout::session_run_files(logs_dir, "log", session_id) {
-        if protected.iter().any(|path| path == &found.path) {
+        if protected
+            .iter()
+            .any(|path| names_same_file(path, &found.path))
+        {
             continue;
         }
         let Ok(metadata) = fs::metadata(&found.path) else {
@@ -259,6 +262,32 @@ fn scan(logs_dir: &Path, session_id: Option<&str>, protected: &[PathBuf]) -> Vec
         });
     }
     files
+}
+
+/// Whether two paths name the same file, matched the way the filesystem that
+/// holds it does.
+///
+/// The two sides come from different places — the walked tree, and the
+/// configuration's own spelling of the same location — and on Windows those
+/// agree only case-insensitively, component by component: a path typed
+/// `C:\Users\…` protects a file the walk reports as `c:\users\…` just the
+/// same, and a separator typed `/` names the same file as `\`. A compare that
+/// missed either would treat an application's own log as nobody's and sweep
+/// it.
+fn names_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let lowered = |path: &Path| -> Vec<String> {
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        };
+        lowered(left) == lowered(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +585,43 @@ mod tests {
         assert_eq!(swept.removed, preview.removed);
         assert!(!hub_stale.exists(), "the Hub's own stale log was not taken");
         assert!(application_owned.exists(), "a protected path was deleted");
+        assert!(hub_current.exists(), "the newest run's log was taken");
+    }
+
+    /// The protected path is the *configuration's* spelling of the file, the
+    /// walked path is the tree's, and on Windows the two agree only
+    /// case-insensitively — a casing difference must not turn an application's
+    /// own log into nobody's.
+    #[cfg(windows)]
+    #[test]
+    fn a_protected_path_is_matched_the_way_windows_matches_paths() {
+        let dir = TempDir::new();
+        let month = dir.join("svc/2026-09");
+        fs::create_dir_all(&month).expect("a month folder");
+        let application_owned = month.join("app-access.log");
+        let hub_stale = month.join("run-old.log");
+        let hub_current = month.join("run-new.log");
+        for path in [&application_owned, &hub_stale, &hub_current] {
+            fs::write(path, b"0123456789").expect("writable");
+        }
+        age_by_days(&application_owned, 60);
+        age_by_days(&hub_stale, 45);
+        let policy = RetentionPolicy {
+            max_age_days: 30,
+            max_session_bytes: 5,
+        };
+
+        // Same file, spelled differently — as a hand-written config would.
+        let protected = vec![application_owned.to_string_lossy().to_uppercase().into()];
+        let preview = cleanup_preview(dir.path(), None, &policy, now(), &protected);
+        let swept = enforce(dir.path(), None, &policy, now(), &protected);
+
+        assert_eq!(preview.removed, vec![hub_stale.clone()]);
+        assert_eq!(swept.removed, preview.removed);
+        assert!(
+            application_owned.exists(),
+            "the application's log was swept because the config spelled it differently"
+        );
         assert!(hub_current.exists(), "the newest run's log was taken");
     }
 

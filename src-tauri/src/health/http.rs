@@ -37,6 +37,14 @@ impl HttpTarget {
         if host.is_empty() {
             return None;
         }
+        // A URL that spells its port as `:0` names no port at all: on the
+        // secure path `0` reaches `WinHttpConnect`, whose documented reading
+        // is "the default port", and the probe would answer a service on 443
+        // in this URL's name. That is not a request the Hub can make honestly,
+        // so no probe is issued.
+        if parsed.port() == Some(0) {
+            return None;
+        }
         let port = parsed.port_or_known_default()?;
         let path = request_path(&parsed)?;
         Some(Self {
@@ -346,5 +354,21 @@ mod winhttp {
             .filter(|unit| *unit != 0)
             .chain([0])
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A URL that spells `:0` names no port to probe: handing `0` to the
+    /// secure path's connect would dial the scheme's default port in this
+    /// URL's name. A URL without a port still resolves to that default.
+    #[test]
+    fn an_explicit_zero_port_is_not_probeable() {
+        assert!(HttpTarget::parse("https://127.0.0.1:0/").is_none());
+        assert!(HttpTarget::parse("http://127.0.0.1:0/status").is_none());
+        assert_eq!(HttpTarget::parse("https://127.0.0.1/").unwrap().port, 443);
+        assert_eq!(HttpTarget::parse("http://127.0.0.1/").unwrap().port, 80);
     }
 }

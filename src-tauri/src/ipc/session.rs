@@ -287,7 +287,7 @@ pub fn resolve_session_open(
                     return Err(SessionError::failed(
                         &session_id,
                         OPERATION,
-                        "associating an instance needs both its pid and its creation time, and                          this request was missing one of them"
+                        "associating an instance needs both its pid and its creation time, and this request was missing one of them"
                             .to_owned(),
                         None,
                     ))

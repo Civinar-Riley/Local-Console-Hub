@@ -65,7 +65,8 @@ pub fn validate_entry(
             "id",
             format!(
                 "session id `{id}` is not filesystem-safe — use 1-64 ASCII letters, digits, \
-                 `-` or `_`, starting with a letter or digit (ids become log directory names)"
+                 `-` or `_`, starting with a letter or digit, and not a Windows device name \
+                 such as `nul` (ids become log directory names)"
             ),
         ));
     }

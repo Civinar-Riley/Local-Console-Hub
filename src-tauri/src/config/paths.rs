@@ -22,7 +22,10 @@ use chrono::{DateTime, FixedOffset};
 /// and run ids become directory/file names — D-011).
 ///
 /// Rules: 1..=64 chars, ASCII alphanumeric/`_`/`-` only, must start with an
-/// alphanumeric character.
+/// alphanumeric character, and not one of the names Windows reserves for its
+/// own devices: a log directory named `nul` is silently redirected to the
+/// device instead of created, so such an id is refused here rather than left
+/// to fail at its first log write.
 pub fn is_filesystem_safe_component(value: &str) -> bool {
     let bytes = value.as_bytes();
     match bytes.first() {
@@ -33,6 +36,33 @@ pub fn is_filesystem_safe_component(value: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com0"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt0"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
 }
 
 /// Directory name used under both app-data roots.
@@ -333,5 +363,26 @@ mod tests {
         );
         let path = run_log_path(Path::new("logs"), "st", 1_790_213_415, offset, "ab12");
         assert!(path.is_some(), "offset {offset} produced no log path");
+    }
+
+    /// A component that would be redirected to a Windows device — `nul`,
+    /// `com1`, in any casing — names no directory this Hub can create, so it
+    /// is refused before it becomes a log path that only fails at write time.
+    #[test]
+    fn a_windows_device_name_is_not_a_safe_component() {
+        for reserved in ["nul", "NUL", "con", "Com1", "lpt3", "aux", "prn"] {
+            assert!(
+                !is_filesystem_safe_component(reserved),
+                "{reserved} is a device name, not a directory name"
+            );
+        }
+        // The rule is about the whole component, not a substring: ordinary ids
+        // that merely contain these letters stay legal.
+        for ordinary in ["nulled", "console", "comfyui", "st-1"] {
+            assert!(
+                is_filesystem_safe_component(ordinary),
+                "{ordinary} is an ordinary id"
+            );
+        }
     }
 }
