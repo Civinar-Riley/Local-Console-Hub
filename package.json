@@ -1,7 +1,7 @@
 {
   "name": "local-console-hub",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local Console Hub — unified console for Windows local services and terminals",
   "type": "module",
   "scripts": {
