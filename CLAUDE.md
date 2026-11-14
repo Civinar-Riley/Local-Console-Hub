@@ -22,6 +22,9 @@ PRODUCT_SPEC / MVP_IMPLEMENTATION_SPEC / EXECUTION_PLAN / UI_STYLE_GUIDE / LOGGI
 
 ## 开发环境注意事项
 
+- **编译 / 测试 / 构建（cargo、npm 等）一律在 instabox 沙箱上跑**，不在本地执行。
+  本机只负责改代码和静态阅读；产物验证（`cargo build` / `cargo test` / `npm test` / `npm run build`）
+  通过 instabox MCP 工具（`mcp__instabox__*`）在沙箱内完成。
 - 开发服务器端口使用 **24120**（或同段不常用端口）。禁止使用 Tauri 默认端口 1420：
   它落在 Windows 的保留端口范围内，可能随机导致启动失败。
   修改端口时 `vite.config.ts` 与 `src-tauri/tauri.conf.json` 必须一起改。

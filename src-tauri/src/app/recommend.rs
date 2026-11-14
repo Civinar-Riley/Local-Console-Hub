@@ -238,22 +238,23 @@ fn pe_subsystem(path: &Path) -> Option<u16> {
         return None;
     }
 
-    // The optional header begins right after the 20-byte COFF header; its
-    // `Subsystem` sits at a different offset in the 32- and 64-bit layouts
-    // because `ImageBase` is 8 bytes wide in the latter.
+    // The optional header begins right after the 20-byte COFF header. The
+    // `Subsystem` sits at the same offset in the 32- and 64-bit layouts: PE32
+    // carries a 4-byte `BaseOfData` the 64-bit layout drops, and the 64-bit
+    // layout widens `ImageBase` to 8 bytes — the two differences cancel, so
+    // one offset serves both. At PE32's `CheckSum` (offset 64) the field this
+    // read used to land on, a 32-bit image's console/GUI answer was whatever
+    // its checksum's low word happened to be.
     let optional = pe_offset + 4 + 20;
     let mut magic = [0u8; 2];
     file.seek(SeekFrom::Start(optional)).ok()?;
     file.read_exact(&mut magic).ok()?;
-    let subsystem_offset = match u16::from_le_bytes(magic) {
-        0x10b => 64, // PE32
-        0x20b => 68, // PE32+
-        _ => return None,
-    };
+    if !matches!(u16::from_le_bytes(magic), 0x10b | 0x20b) {
+        return None;
+    }
 
     let mut subsystem = [0u8; 2];
-    file.seek(SeekFrom::Start(optional + subsystem_offset))
-        .ok()?;
+    file.seek(SeekFrom::Start(optional + 68)).ok()?;
     file.read_exact(&mut subsystem).ok()?;
     Some(u16::from_le_bytes(subsystem))
 }
@@ -384,6 +385,39 @@ mod tests {
         std::fs::write(&not_an_image, b"#!/bin/sh\necho hello\n").expect("the fixture is written");
         assert!(launch_kind(&not_an_image).is_none());
         let _ = std::fs::remove_file(&not_an_image);
+    }
+
+    /// The `Subsystem` field sits at the same optional-header offset in the
+    /// 32- and 64-bit layouts — their differences (`BaseOfData`, the wider
+    /// `ImageBase`) cancel — and not at `CheckSum`, whose low word a 32-bit
+    /// image's subsystem answer used to be read from.
+    #[test]
+    fn a_pe32_image_reports_its_own_subsystem_field() {
+        let mut image = vec![0u8; 160];
+        image[0..2].copy_from_slice(b"MZ");
+        image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // The optional header starts at 0x58. The checksum's low word holds
+        // the console value, so an offset-64 read would call this image a
+        // console program whatever its real answer was.
+        let optional = 0x58usize;
+        let checksum_low_word = 3u16;
+        let subsystem = 2u16; // IMAGE_SUBSYSTEM_WINDOWS_GUI
+
+        image[optional..optional + 2].copy_from_slice(&0x10bu16.to_le_bytes()); // PE32
+        image[optional + 64..optional + 66].copy_from_slice(&checksum_low_word.to_le_bytes());
+        image[optional + 68..optional + 70].copy_from_slice(&subsystem.to_le_bytes());
+
+        let path = std::env::temp_dir().join("lch-pe-subsystem-fixture.exe");
+        std::fs::write(&path, &image).expect("the PE32 fixture is written");
+        assert_eq!(launch_kind(&path), Some(LaunchKind::Graphical));
+
+        // The 64-bit layout answers the same field at the same offset.
+        image[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes()); // PE32+
+        image[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
+        std::fs::write(&path, &image).expect("the PE32+ fixture is written");
+        assert_eq!(launch_kind(&path), Some(LaunchKind::Console));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A batch file in a scratch directory, with a path a user could actually

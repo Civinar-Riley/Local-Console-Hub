@@ -213,10 +213,19 @@ fn current_model<R: Runtime>(app: &AppHandle<R>) -> TrayModel {
 }
 
 /// Rebuild the tray's menu if the registry's reading changed.
+///
+/// The whole read–build–set–record sequence holds `last`. Events arrive on
+/// whichever thread published them — a per-session watcher, a stop worker, an
+/// IPC command — so two can be in `refresh` at once, and dropping the lock
+/// between the compare and the record would let the older reading overwrite
+/// the newer one's menu, then make every later event look "unchanged" against
+/// the record it left behind. Serialised, the last refresh in line reads a
+/// registry at least as new as the model it compares against, and its build is
+/// the one the tray ends up showing.
 fn refresh<R: Runtime>(app: &AppHandle<R>, last: &Mutex<Option<TrayModel>>) {
+    let mut last_model = lock(last);
     let model = current_model(app);
-    let unchanged = lock(last).as_ref() == Some(&model);
-    if unchanged {
+    if last_model.as_ref() == Some(&model) {
         return;
     }
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -231,7 +240,7 @@ fn refresh<R: Runtime>(app: &AppHandle<R>, last: &Mutex<Option<TrayModel>>) {
     // The tooltip is a hint, not the surface: a failure there leaves the menu
     // correct, so the model is still the one on screen.
     let _ = tray.set_tooltip(Some(&model.tooltip));
-    *lock(last) = Some(model);
+    *last_model = Some(model);
 }
 
 /// Handle one tray menu click.

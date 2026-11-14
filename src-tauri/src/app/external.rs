@@ -185,7 +185,8 @@ pub fn confirm(
     };
     let Some(readings) = process::processes_named(&target.file_names) else {
         return Err(
-            "the process table could not be read, so the Hub cannot confirm the instance you              picked"
+            "the process table could not be read, so the Hub cannot confirm the instance you \
+             picked"
                 .to_owned(),
         );
     };
@@ -310,11 +311,40 @@ fn verdict(target: &Target, reading: &ProcessReading) -> Verdict {
     match reading.image_path {
         // Read, and it is a different file — which is exactly the "同名" case
         // decision 11 says is not evidence, so it is not a candidate either.
-        Some(_) => Verdict::No,
+        // The one shape this cannot settle is the batch host: a `.bat` is not a
+        // process, so the script the configuration names travels as an
+        // *argument* of `cmd.exe`, and a shell started the way users commonly
+        // spell it (`run.bat`, `cmd /c run.bat`) leaves that argument relative.
+        // Which directory it resolves against is the host's own working
+        // directory, and the command line does not carry it — `No` there would
+        // start a second copy of an application that may well already be
+        // running, so the question goes to the user instead of to a guess
+        // (decision 11). An ordinary program's image *is* the program, so for
+        // it a relative token proves nothing and the row stays `No`.
+        Some(_) => {
+            if is_batch_host(reading) && names_program_relatively(reading, &target.program) {
+                Verdict::Unknown {
+                    reason: "它的命令行用相对路径提到这个名字，Hub 无法确认它解析到哪个目录"
+                        .to_owned(),
+                }
+            } else {
+                Verdict::No
+            }
+        }
         None => Verdict::Unknown {
             reason: "无法读取这个进程的映像路径（通常是权限不足）".to_owned(),
         },
     }
+}
+
+/// Whether this reading is a batch interpreter: the one process whose command
+/// line can be running a *script* rather than the program its image names.
+fn is_batch_host(reading: &ProcessReading) -> bool {
+    reading
+        .image_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.eq_ignore_ascii_case("cmd.exe"))
 }
 
 /// Whether the command line names `program` as one of its tokens.
@@ -330,6 +360,33 @@ fn names_program(reading: &ProcessReading, program: &Path) -> bool {
     tokens_of(line)
         .iter()
         .any(|token| same_path(Path::new(token), program))
+}
+
+/// Whether a batch host's command line names `program`'s file name only
+/// relatively.
+///
+/// The complement of [`names_program`] for the batch shape: a shell started
+/// the way users commonly spell it — `run.bat`, `.\run.bat`, `cmd /c run.bat`
+/// from the configured directory — leaves the script's name relative on the
+/// host's command line. Resolving that token needs the host process's working
+/// directory, which the command line does not carry, so this is a question the
+/// Hub asks rather than an identity it claims. [`is_batch_host`] gates it: an
+/// ordinary program's command line carries its own image's name, which a bare
+/// spelling proves nothing about.
+fn names_program_relatively(reading: &ProcessReading, program: &Path) -> bool {
+    let Some(name) = program.file_name() else {
+        return false;
+    };
+    let Some(line) = reading.command_line.as_deref() else {
+        return false;
+    };
+    tokens_of(line).iter().any(|token| {
+        let token = Path::new(token);
+        !token.is_absolute()
+            && token
+                .file_name()
+                .is_some_and(|named| named.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Whether the process was started with the arguments the configuration passes.
@@ -491,7 +548,7 @@ fn reason_for(candidates: &[Candidate]) -> String {
     }
     if unreadable > 0 {
         parts.push(format!(
-            "另有 {unreadable} 个同名进程，Hub 没有权限确认它们是不是同一个程序"
+            "另有 {unreadable} 个同名进程，Hub 无法确认它们是不是同一个程序"
         ));
     }
     if parts.is_empty() {
@@ -737,6 +794,50 @@ mod tests {
         assert_eq!(certain(&found).identity.pid(), 42);
     }
 
+    /// The same script started the way a user types it — `run.bat` from the
+    /// configured directory, so the host's command line names it *relatively* —
+    /// is a question rather than a second copy: which directory that token
+    /// resolves against is the host's own working directory, and the command
+    /// line does not carry it. A guess here is exactly the silent duplicate
+    /// start decision 11 forbids.
+    #[test]
+    fn a_script_named_relatively_by_a_host_process_is_asked_about() {
+        let readings = [reading(
+            42,
+            Some("C:\\Windows\\System32\\cmd.exe"),
+            Some("\"C:\\Windows\\System32\\cmd.exe\" /d /c run.bat"),
+        )];
+
+        let found = classify(&target("D:\\ComfyUI\\run.bat", &[]), &readings);
+
+        let ambiguity = ambiguous(&found);
+        assert_eq!(ambiguity.candidates.len(), 1);
+        assert!(
+            !ambiguity.candidates[0].associable(),
+            "a relative token is not an identity the Hub can confirm"
+        );
+        assert!(
+            ambiguity.candidates[0].reason.contains("相对路径"),
+            "{}",
+            ambiguity.candidates[0].reason
+        );
+    }
+
+    /// And a host running a *differently named* script stays "not it": the name
+    /// the command line carries is not this entry's at all.
+    #[test]
+    fn a_host_running_another_script_by_name_is_not_a_candidate() {
+        let readings = [reading(
+            42,
+            Some("C:\\Windows\\System32\\cmd.exe"),
+            Some("\"C:\\Windows\\System32\\cmd.exe\" /d /c other.bat"),
+        )];
+
+        let found = classify(&target("D:\\ComfyUI\\run.bat", &[]), &readings);
+
+        assert_eq!(found, Outside::None);
+    }
+
     /// A process the Hub may not inspect is "could not confirm", never "not
     /// it" — the difference between the two is the whole reason the Hub asks
     /// instead of starting a second copy.
@@ -753,7 +854,11 @@ mod tests {
             !ambiguity.candidates[0].associable(),
             "a process with no creation time has no identity to remember"
         );
-        assert!(ambiguity.reason.contains("权限"), "{}", ambiguity.reason);
+        assert!(
+            ambiguity.reason.contains("无法确认"),
+            "{}",
+            ambiguity.reason
+        );
     }
 
     /// Nothing running is the ordinary answer, and it is not a question.
